@@ -1,30 +1,14 @@
-mod crypto;
-mod chain;
-mod consensus;
-mod wallet;
-mod network;
-mod metrics;
-mod governance;
-mod cli;
-
-use crate::chain::{Transaction, TxInput, TxOutput};
-use crate::consensus::{PoSState, Staker};
-use crate::wallet::Wallet;
-use crate::chain::Blockchain;
-use crate::cli::CliHandler;
-use log::info;
-use network::P2PNetwork;
-use anyhow::Result;
 use juliuscoin::{
-    Transaction, TxInput, TxOutput,
-    Blockchain,
-    PoSState, Staker,
-    Wallet,
-    P2PNetwork,
-    Governance, JIPType, JIPStatus, VoteType
+    blockchain::chain::Blockchain,
+    blockchain::utxo::Transaction,
+    blockchain::consensus::{PoSState, Staker},
+    cryptography::wallet::Wallet,
+    network::P2PNetwork,
+    governance::Governance,
+    governance::{JIPStatus, JIPType, VoteType}
 };
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use log::info;
+use anyhow::Result;
 use std::error::Error;
 
 /// メイン関数
@@ -36,14 +20,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Initialize components
     let mut chain = Blockchain::new();
-    let mut wallet = Wallet::new();
-    let mut network = P2PNetwork::new().await?;
-    let mut governance = Governance::new();
+    let mut wallet = Wallet::new()?;
+    let mut network = P2PNetwork::new();
+    let mut governance = Governance::new(1000, 1000); // Minimum stake and voting period
     let mut pos_state = PoSState::new().expect("Failed to initialize PoS state");
-    let mempool = Vec::new();
-
-    // Start network services
-    network.start().await?;
+    let mempool: Vec<Transaction> = Vec::new();
 
     // Main blockchain loop
     loop {
@@ -51,29 +32,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         // Process pending transactions
         if let Some(tx) = mempool.first() {
-            if chain.validate_transaction(tx) {
-                chain.add_transaction(tx.clone());
+            if chain.apply_transaction(tx) {
+                info!("Transaction processed successfully");
             }
         }
 
         // Process governance proposals
-        if let Some(proposal) = governance.get_active_proposals().first() {
-            if proposal.status == JIPStatus::Voting {
-                governance.process_votes(proposal);
-            }
+        if let Some(proposal) = governance.proposals.iter().find(|p| p.status == JIPStatus::Voting) {
+            governance.update_proposal_status(proposal.id);
         }
 
         // Update validator set
-        for staker in pos_state.get_validators() {
+        let stakers: Vec<_> = pos_state.stakers.values().collect();
+        for staker in stakers {
             if staker.stake_amount > 1000 {
-                pos_state.add_validator(staker.clone());
+                info!("Validator {} active with stake {}", 
+                    hex::encode(&staker.address_hash), 
+                    staker.stake_amount
+                );
             }
         }
 
         // Consensus step
-        if let Some(block) = chain.create_block() {
-            chain.add_block(block)?;
-            network.broadcast_block(&block).await?;
+        if let Some(block) = chain.propose_block(&pos_state) {
+            if chain.add_block(block) {
+                info!("New block added to chain");
+            }
         }
     }
 }

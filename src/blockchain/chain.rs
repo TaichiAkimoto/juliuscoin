@@ -233,4 +233,27 @@ impl Blockchain {
         hasher.update(&encoded);
         hasher.finalize().to_vec()
     }
+
+    pub fn propose_block(&self, pos_state: &PoSState) -> Option<Block> {
+        let last_block = self.blocks.last()?;
+        let next_index = last_block.index + 1;
+        let prev_hash = self.hash_block(last_block);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // For MVP, we're not implementing actual transaction selection
+        // In production, this would select transactions from mempool
+        let transactions = Vec::new();
+
+        Some(Block {
+            index: next_index,
+            prev_hash,
+            timestamp,
+            transactions,
+            proposer_address: Vec::new(), // Should be set to actual proposer
+            block_signature: Vec::new(),  // Should be signed by proposer
+        })
+    }
 }

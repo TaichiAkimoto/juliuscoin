@@ -1,5 +1,4 @@
-use vrf::openssl::{CipherSuite, ECVRF};
-use vrf::VRF;
+use vrf::openssl::ECVRF;
 use crate::blockchain::consensus::staking::Staker;
 
 pub fn select_proposer<'a>(
