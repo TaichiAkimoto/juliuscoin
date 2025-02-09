@@ -1,33 +1,54 @@
-use serde::{Serialize, Deserialize};
-use crate::crypto::{
-    generate_dilithium_keypair, derive_address_from_pk, PQAddress,
-};
+use bincode::{deserialize, serialize};
+use ed25519_dalek::{Keypair, PublicKey, SecretKey};
 use std::fs;
+use std::path::PathBuf;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum WalletError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] bincode::Error),
+    #[error("Key error: {0}")]
+    KeyError(String),
+}
 
 /// ウォレット構造体
-#[derive(Serialize, Deserialize, Debug)]
 pub struct Wallet {
-    pub public_key: Vec<u8>,
-    pub secret_key: Vec<u8>,
-    pub address_hash: Vec<u8>,
+    keypair: Keypair,
+    wallet_path: PathBuf,
 }
 
 impl Wallet {
     /// 新規ウォレット作成
-    pub fn new() -> Self {
-        let (pk, sk) = generate_dilithium_keypair();
-        let hash = derive_address_from_pk(&pk);
-        Wallet {
-            public_key: pk,
-            secret_key: sk,
-            address_hash: hash,
+    pub fn new(wallet_path: PathBuf) -> Result<Self, WalletError> {
+        if wallet_path.exists() {
+            // 既存のウォレットを読み込む
+            let data = fs::read(&wallet_path)?;
+            let keypair: Keypair = deserialize(&data)?;
+            Ok(Self {
+                keypair,
+                wallet_path,
+            })
+        } else {
+            // 新しいウォレットを作成
+            let mut rng = rand::thread_rng();
+            let keypair = Keypair::generate(&mut rng);
+            let wallet = Self {
+                keypair,
+                wallet_path,
+            };
+            wallet.save()?;
+            Ok(wallet)
         }
     }
 
     /// ウォレットをファイルに保存
-    pub fn save_to_file(&self, path: &str) {
-        let data = bincode::serialize(&self).unwrap();
-        fs::write(path, data).expect("Failed to write wallet file");
+    pub fn save(&self) -> Result<(), WalletError> {
+        let data = serialize(&self.keypair)?;
+        fs::write(&self.wallet_path, data)?;
+        Ok(())
     }
 
     /// ファイルからウォレットをロード
@@ -36,11 +57,11 @@ impl Wallet {
         bincode::deserialize(&data).expect("Failed to deserialize wallet")
     }
 
-    #[allow(dead_code)]
-    pub fn get_address(&self) -> PQAddress {
-        PQAddress {
-            public_key: self.public_key.clone(),
-            hash: self.address_hash.clone(),
-        }
+    pub fn public_key(&self) -> PublicKey {
+        self.keypair.public
+    }
+
+    pub fn sign(&self, message: &[u8]) -> ed25519_dalek::Signature {
+        self.keypair.sign(message)
     }
 }
