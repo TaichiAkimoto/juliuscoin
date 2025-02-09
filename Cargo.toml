@@ -22,6 +22,11 @@ vrf = "0.2.4"       # VRF実装用
 lazy_static = "1.4.0"
 ed25519-dalek = "1.0"
 thiserror = "1.0"
+aes-gcm = "0.10.3"  # AES-GCM for hybrid encryption
+rand_core = "0.6"   # For secure nonce generation
+pbkdf2 = "0.12"
+hmac = "0.12"
+clap = { version = "4.4", features = ["derive"] }
 
 # 量子耐性のある暗号アルゴリズムのための依存関係
 # sphincsplus = "0.1"  # SPHINCS+用（必要に応じてコメントを外す）
