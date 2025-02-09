@@ -62,7 +62,7 @@ impl Mnemonic {
     }
 
     pub fn to_seed(&self) -> Vec<u8> {
-        use pbkdf2::{pbkdf2_hmac, Pbkdf2};
+        use pbkdf2::pbkdf2_hmac;
         use sha2::Sha512;
         
         let salt = b"mnemonic";

@@ -55,7 +55,7 @@ impl Wallet {
 
     pub fn from_mnemonic(phrase: &str) -> Result<Self, WalletError> {
         let mnemonic = Mnemonic::from_phrase(phrase)?;
-        let seed = mnemonic.to_seed();
+        let _seed = mnemonic.to_seed();
         let keypair = generate_dilithium_keypair();
         let public_key = keypair.public.as_bytes().to_vec();
         let secret_key = keypair.secret.as_bytes().to_vec();
