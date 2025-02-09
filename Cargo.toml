@@ -20,3 +20,7 @@ anyhow = "1.0"
 futures = "0.3"
 vrf = "0.2.4"       # VRF実装用
 lazy_static = "1.4.0"
+
+# 量子耐性のある暗号アルゴリズムのための依存関係
+# sphincsplus = "0.1"  # SPHINCS+用（必要に応じてコメントを外す）
+# falcon = "0.1"      # Falcon用（必要に応じてコメントを外す）
