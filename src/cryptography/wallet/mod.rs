@@ -3,7 +3,8 @@ mod storage;
 
 use std::path::PathBuf;
 use thiserror::Error;
-use crate::cryptography::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk, DilithiumKeypair};
+use crate::cryptography::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk};
+use pqcrypto_traits::sign::{PublicKey, SecretKey};
 use bincode::{deserialize, serialize};
 use ed25519_dalek::v3::{Keypair, PublicKey, SecretKey};
 use std::fs;

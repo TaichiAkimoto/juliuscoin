@@ -15,6 +15,7 @@ use vrf::openssl::{ECVRF, CipherSuite};
 use vrf::VRF;
 use crate::cryptography::crypto::PQAddress as Address;
 use std::collections::HashMap;
+use crate::blockchain::chain::UTXO;
 
 /// Unique identifier for an Unspent Transaction Output (UTXO).
 /// 
@@ -180,7 +181,7 @@ impl UTXOSet {
         self.validators.get(address)
     }
 
-    pub fn transfer(&mut self, from: &Address, to: &Address, amount: u64) -> Result<(), String> {
+    pub fn transfer(&mut self, _from: &Address, _to: &Address, _amount: u64) -> Result<(), String> {
         // Implementation needed
         Ok(())
     }
@@ -200,7 +201,7 @@ impl UTXOSet {
             return None;
         }
 
-        let vrf = ECVRF::from_suite(vrf::CipherSuite::SECP256K1_SHA256_TAI).unwrap();
+        let vrf = ECVRF::from_suite(CipherSuite::SECP256K1_SHA256_TAI).unwrap();
         
         // VRFを使用して各バリデータのランダム値を生成
         let mut validator_scores: Vec<(Address, f64)> = validators

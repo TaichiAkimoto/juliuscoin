@@ -34,7 +34,7 @@ impl PQAddress {
         Self { hash: hash.to_vec() }
     }
 
-    pub fn from_string(s: &str) -> Result<Self, String> {
+    pub fn from_string(s: &str) -> std::result::Result<Self, String> {
         Ok(Self { hash: s.as_bytes().to_vec() })
     }
 }

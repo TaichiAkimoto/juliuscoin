@@ -36,20 +36,22 @@ impl WalletStorage {
     }
 
     pub fn load(path: &str) -> Result<Wallet, WalletError> {
-        let data = fs::read(path)?;
-        let wallet_data: WalletData = bincode::deserialize(&data)?;
+        let data = WalletStorage::read_wallet_data(path)?;
+        let path_buf = PathBuf::from(path);
         
-        let mnemonic = match wallet_data.mnemonic {
-            Some(phrase) => Some(Mnemonic::from_phrase(&phrase)?),
-            None => None,
-        };
-
         Ok(Wallet {
-            public_key: wallet_data.public_key,
-            secret_key: wallet_data.secret_key,
-            address_hash: wallet_data.address_hash,
-            mnemonic,
+            public_key: data.public_key,
+            secret_key: data.secret_key,
+            address_hash: data.address_hash,
+            mnemonic: data.mnemonic.map(|m| m.as_str().to_string()),
+            path: path_buf.clone(),
             storage: WalletStorage::new(path),
         })
+    }
+
+    fn read_wallet_data(path: &str) -> Result<WalletData, WalletError> {
+        let data = fs::read(path)?;
+        let wallet_data: WalletData = bincode::deserialize(&data)?;
+        Ok(wallet_data)
     }
 } 

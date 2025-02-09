@@ -1,6 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use crate::crypto::PQAddress;
+use crate::cryptography::crypto::PQAddress;
 
 /// JIP (Julius Improvement Proposal) の状態
 #[derive(Debug, Clone, Serialize, Deserialize)]
