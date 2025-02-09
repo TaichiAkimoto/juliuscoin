@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::cryptography::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk};
 use pqcrypto_traits::sign::{PublicKey, SecretKey};
 use bincode::{deserialize, serialize};
-use ed25519_dalek::v3::{Keypair, PublicKey, SecretKey};
+use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signer, Verifier};
 use std::fs;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};

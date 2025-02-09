@@ -62,11 +62,17 @@ impl Mnemonic {
     }
 
     pub fn to_seed(&self) -> Vec<u8> {
-        use pbkdf2::pbkdf2_simple;
+        use pbkdf2::{pbkdf2_hmac, Pbkdf2};
+        use sha2::Sha512;
         
         let salt = b"mnemonic";
         let mut seed = vec![0u8; 64];
-        pbkdf2_simple(&self.phrase, salt, &mut seed).unwrap();
+        pbkdf2_hmac::<Sha512>(
+            self.phrase.as_bytes(),
+            salt,
+            2048,
+            &mut seed
+        );
         seed
     }
 

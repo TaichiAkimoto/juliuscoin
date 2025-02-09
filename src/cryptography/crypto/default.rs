@@ -2,6 +2,7 @@ use super::traits::{CryptoOperations, Result};
 use sha2::{Sha256, Digest};
 use pqcrypto_dilithium::dilithium5::{PublicKey, SecretKey, keypair, detached_sign, verify_detached_signature};
 use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature};
+use serde::{Serialize, Deserialize};
 
 pub struct DefaultCrypto;
 
@@ -24,7 +25,7 @@ impl CryptoOperations for DefaultCrypto {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PQAddress {
     pub hash: Vec<u8>,
 }
@@ -59,8 +60,11 @@ pub fn derive_address_from_pk(pk: &[u8]) -> Vec<u8> {
 }
 
 pub fn verify_signature(message: &[u8], signature: &[u8], public_key: &[u8]) -> bool {
-    if let Ok(pk) = PublicKey::from_bytes(public_key) {
-        verify_detached_signature(signature, message, &pk).is_ok()
+    if let (Ok(pk), Ok(sig)) = (
+        PublicKey::from_bytes(public_key),
+        pqcrypto_dilithium::dilithium5::DetachedSignature::from_bytes(signature)
+    ) {
+        verify_detached_signature(&sig, message, &pk).is_ok()
     } else {
         false
     }

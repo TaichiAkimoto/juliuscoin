@@ -201,7 +201,7 @@ impl UTXOSet {
             return None;
         }
 
-        let vrf = ECVRF::from_suite(CipherSuite::SECP256K1_SHA256_TAI).unwrap();
+        let mut vrf = ECVRF::from_suite(CipherSuite::SECP256K1_SHA256_TAI).unwrap();
         
         // VRFを使用して各バリデータのランダム値を生成
         let mut validator_scores: Vec<(Address, f64)> = validators
