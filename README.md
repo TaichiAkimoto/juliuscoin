@@ -10,6 +10,33 @@ A blockchain implementation in Rust featuring:
 
 - Rust and Cargo (latest stable version)
 
+## Cryptographic Performance Metrics
+
+The implementation includes built-in metrics for measuring the performance and size characteristics of quantum-resistant cryptography:
+
+- Signature sizes (Dilithium vs ECDSA comparison)
+- Key sizes (public and private keys)
+- Operation timing (signing and verification)
+- Block metrics (signature data ratio)
+
+Example metrics output:
+
+```
+=== 量子耐性暗号メトリクス ===
+Dilithium公開鍵サイズ: 1312 bytes
+Dilithium秘密鍵サイズ: 2528 bytes
+Dilithium署名サイズ: 2420 bytes
+平均署名時間: 1.2ms
+平均検証時間: 0.4ms
+
+=== ECDSA比較 ===
+ECDSA公開鍵サイズ: 33 bytes
+ECDSA署名サイズ: 71-72 bytes
+Dilithium/ECDSA署名サイズ比: 33.6倍
+```
+
+These metrics help in understanding the practical implications of using post-quantum cryptography in a blockchain context.
+
 ## Building
 
 ```bash

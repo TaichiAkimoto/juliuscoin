@@ -3,6 +3,7 @@ mod chain;
 mod consensus;
 mod wallet;
 mod network;
+mod metrics;
 
 use crate::chain::{Transaction, TxInput, TxOutput};
 use crate::consensus::{Staker, pos_step};
@@ -94,6 +95,10 @@ async fn main() -> Result<()> {
     let network = P2PNetwork::new(8333);
     println!("P2Pネットワークを起動します...");
     network.start().await?;
+
+    // 暗号メトリクスを表示
+    let metrics = crypto::CRYPTO_METRICS.lock().unwrap();
+    metrics.print_stats();
 
     Ok(())
 }
