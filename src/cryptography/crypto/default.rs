@@ -1,24 +1,26 @@
-use super::traits::CryptoOperations;
-use crate::error::Result;
+use super::traits::{CryptoOperations, Result};
 use sha2::{Sha256, Digest};
 use pqcrypto_dilithium::dilithium5::{PublicKey, SecretKey, keypair, detached_sign, verify_detached_signature};
+use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _, DetachedSignature};
 
 pub struct DefaultCrypto;
 
 impl CryptoOperations for DefaultCrypto {
     fn generate_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-        // 現在の暗号実装をここに移動
-        unimplemented!()
+        let (pk, sk) = keypair();
+        Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
     }
 
     fn sign(private_key: &[u8], message: &[u8]) -> Result<Vec<u8>> {
-        // 現在の署名実装をここに移動
-        unimplemented!()
+        let sk = SecretKey::from_bytes(private_key)?;
+        let signature = detached_sign(message, &sk);
+        Ok(signature.as_bytes().to_vec())
     }
 
     fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
-        // 現在の検証実装をここに移動
-        unimplemented!()
+        let pk = PublicKey::from_bytes(public_key)?;
+        let sig = pqcrypto_dilithium::dilithium5::DetachedSignature::from_bytes(signature)?;
+        Ok(verify_detached_signature(&sig, message, &pk).is_ok())
     }
 }
 

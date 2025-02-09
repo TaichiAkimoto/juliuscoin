@@ -10,7 +10,7 @@
 //! and block validation.
 
 use serde::{Serialize, Deserialize};
-use crate::crypto::verify_signature;
+use crate::cryptography::crypto::{verify_signature, derive_address_from_pk};
 use log::info;
 
 /// Represents an Unspent Transaction Output (UTXO) in the blockchain.
@@ -136,7 +136,7 @@ impl Blockchain {
                 return false;
             }
             // 入力のowner_hashとpub_keyのハッシュが一致するかチェック
-            let pk_hash = crate::crypto::derive_address_from_pk(&inp.pub_key);
+            let pk_hash = derive_address_from_pk(&inp.pub_key);
             if pk_hash != utxo.owner_hash {
                 info!("所有者ハッシュが一致しません");
                 return false;

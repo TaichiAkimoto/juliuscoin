@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use crate::governance::{Governance, JIPType, JIPStatus, VoteType};
-use crate::crypto::PQAddress;
+use crate::governance::governance::{Governance, JIPType, JIPStatus, VoteType};
+use crate::cryptography::crypto::PQAddress;
 use log::info;
 
 #[derive(Parser)]

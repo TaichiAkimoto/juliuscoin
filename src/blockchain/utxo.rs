@@ -11,9 +11,10 @@
 
 use sha2::{Digest, Sha256};
 use std::fmt;
-use vrf::openssl::ECVRF;
-use rand::Rng;
+use vrf::openssl::{ECVRF, CipherSuite};
+use vrf::VRF;
 use crate::cryptography::crypto::PQAddress as Address;
+use std::collections::HashMap;
 
 /// Unique identifier for an Unspent Transaction Output (UTXO).
 /// 
@@ -155,6 +156,34 @@ pub enum SlashingType {
     DoubleProposal,
     /// Voting for conflicting blocks
     DoubleVoting,
+}
+
+#[derive(Debug)]
+pub struct UTXOSet {
+    utxos: HashMap<UtxoId, UTXO>,
+    validators: HashMap<Address, Validator>,
+}
+
+impl UTXOSet {
+    pub fn new() -> Self {
+        Self {
+            utxos: HashMap::new(),
+            validators: HashMap::new(),
+        }
+    }
+
+    pub fn get_validators(&self) -> Vec<&Validator> {
+        self.validators.values().collect()
+    }
+
+    pub fn get_validator(&self, address: &Address) -> Option<&Validator> {
+        self.validators.get(address)
+    }
+
+    pub fn transfer(&mut self, from: &Address, to: &Address, amount: u64) -> Result<(), String> {
+        // Implementation needed
+        Ok(())
+    }
 }
 
 impl UTXOSet {

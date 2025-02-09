@@ -3,7 +3,7 @@ mod storage;
 
 use std::path::PathBuf;
 use thiserror::Error;
-use crate::cryptography::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk};
+use crate::cryptography::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk, DilithiumKeypair};
 use bincode::{deserialize, serialize};
 use ed25519_dalek::v3::{Keypair, PublicKey, SecretKey};
 use std::fs;
@@ -37,8 +37,8 @@ pub struct Wallet {
 impl Wallet {
     pub fn new() -> Self {
         let keypair = generate_dilithium_keypair();
-        let public_key = keypair.public.to_bytes().to_vec();
-        let secret_key = keypair.secret.to_bytes().to_vec();
+        let public_key = keypair.public.as_bytes().to_vec();
+        let secret_key = keypair.secret.as_bytes().to_vec();
         let address_hash = derive_address_from_pk(&public_key);
         let path = PathBuf::from("wallet.dat");
 
@@ -55,13 +55,15 @@ impl Wallet {
     pub fn from_mnemonic(phrase: &str) -> Result<Self, WalletError> {
         let mnemonic = Mnemonic::from_phrase(phrase)?;
         let seed = mnemonic.to_seed();
-        let (pk, sk) = generate_dilithium_keypair();
-        let address_hash = derive_address_from_pk(&pk);
+        let keypair = generate_dilithium_keypair();
+        let public_key = keypair.public.as_bytes().to_vec();
+        let secret_key = keypair.secret.as_bytes().to_vec();
+        let address_hash = derive_address_from_pk(&public_key);
         let path = PathBuf::from("wallet.dat");
 
         Ok(Self {
-            public_key: pk,
-            secret_key: sk,
+            public_key,
+            secret_key,
             address_hash,
             mnemonic: Some(mnemonic.as_str().to_string()),
             path: path.clone(),

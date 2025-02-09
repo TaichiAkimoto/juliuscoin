@@ -1,4 +1,4 @@
-use crate::error::Result;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub trait CryptoOperations {
     fn generate_keypair() -> Result<(Vec<u8>, Vec<u8>)>;
