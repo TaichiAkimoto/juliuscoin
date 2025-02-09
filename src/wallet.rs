@@ -1,7 +1,5 @@
 use serde::{Serialize, Deserialize};
-use crate::crypto::{
-    generate_dilithium_keypair, derive_address_from_pk, PQAddress,
-};
+use crate::crypto::{generate_dilithium_keypair, derive_address_from_pk, PQAddress};
 use std::fs;
 
 /// ウォレット構造体
