@@ -1,3 +1,14 @@
+//! Proof of Stake (PoS) consensus implementation.
+//! 
+//! This module implements a Proof of Stake consensus mechanism with:
+//! - VRF-based validator selection
+//! - Slashing conditions for misbehavior
+//! - Checkpointing for finality
+//! - Stake-weighted block production
+//! 
+//! The implementation includes mechanisms to prevent various attack vectors
+//! and ensure network security through economic incentives.
+
 use crate::chain::{Block, Transaction};
 use crate::Blockchain;
 use crate::crypto::sign_message;
@@ -8,45 +19,66 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 
-/// スラッシング理由
+/// Represents different types of slashable offenses in the PoS system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SlashingReason {
+    /// Proposing multiple blocks at the same height
     DoubleProposal,
+    /// Voting for conflicting blocks at the same height
     DoubleVoting,
+    /// Failed to participate in consensus when selected
     Offline,
 }
 
-/// スラッシング記録
+/// Records a slashing event for a validator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashingRecord {
+    /// Address of the slashed staker
     pub staker_address: Vec<u8>,
+    /// Reason for the slash
     pub reason: SlashingReason,
+    /// Block height at which the slash occurred
     pub block_height: u64,
+    /// Amount of stake slashed as penalty
     pub penalty_amount: u64,
 }
 
-/// ステーカー情報を持つ構造体
+/// Represents a validator in the PoS system.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Staker {
+    /// Hash of the staker's post-quantum address
     pub address_hash: Vec<u8>,
+    /// Amount of coins staked
     pub stake_amount: u64,
+    /// Dilithium public key for block signing
     pub public_key: Vec<u8>,
+    /// VRF secret key for proposer selection
     pub secret_key: Vec<u8>,
+    /// Height of the last block proposed by this staker
     pub last_proposal_height: Option<u64>,
+    /// Timestamp of last consensus participation
     pub last_active_time: u64,
+    /// History of slashing events for this staker
     pub slashing_records: Vec<SlashingRecord>,
 }
 
-/// PoS コンセンサスの状態管理
+/// Maintains the state of the Proof of Stake system.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PoSState {
+    /// Map of staker addresses to their information
     pub stakers: HashMap<Vec<u8>, Staker>,
+    /// VRF instance for random proposer selection
     pub vrf: ECVRF,
+    /// Global history of all slashing events
     pub slashing_records: Vec<SlashingRecord>,
+    /// Height of the last checkpoint block
     pub last_checkpoint_height: u64,
+    /// Number of blocks between checkpoints
     pub checkpoint_interval: u64,
 }
 
 impl PoSState {
+    /// Creates a new PoS state with initial settings
     pub fn new() -> Self {
         Self {
             stakers: HashMap::new(),
@@ -57,7 +89,12 @@ impl PoSState {
         }
     }
 
-    /// スラッシングの実行
+    /// Slashes a staker for misbehavior
+    /// 
+    /// # Arguments
+    /// * `staker_address` - Address of the misbehaving staker
+    /// * `reason` - Type of slashable offense
+    /// * `block_height` - Height at which the offense occurred
     pub fn slash_staker(&mut self, staker_address: &[u8], reason: SlashingReason, block_height: u64) {
         if let Some(staker) = self.stakers.get_mut(staker_address) {
             let penalty_amount = match reason {
@@ -86,7 +123,13 @@ impl PoSState {
         }
     }
 
-    /// VRFを使用してプロポーザーを選出
+    /// Selects the next block proposer using VRF
+    /// 
+    /// # Arguments
+    /// * `seed` - Random seed for VRF (usually previous block hash)
+    /// 
+    /// # Returns
+    /// * `Option<&Staker>` - The selected proposer, if any
     pub fn select_proposer(&self, seed: &[u8]) -> Option<&Staker> {
         let total_stake: u64 = self.stakers.values().map(|s| s.stake_amount).sum();
         if total_stake == 0 {
@@ -118,7 +161,13 @@ impl PoSState {
         selected
     }
 
-    /// チェックポイントの作成と検証
+    /// Creates a checkpoint for finality
+    /// 
+    /// # Arguments
+    /// * `block_height` - Height at which to create the checkpoint
+    /// 
+    /// # Returns
+    /// * `bool` - True if checkpoint was successfully created
     pub fn create_checkpoint(&mut self, block_height: u64) -> bool {
         if block_height - self.last_checkpoint_height >= self.checkpoint_interval {
             // チェックポイントの作成処理
@@ -149,7 +198,16 @@ impl PoSState {
     }
 }
 
-/// ブロック生成
+/// Produces a new block in the PoS system
+/// 
+/// # Arguments
+/// * `chain` - The blockchain instance
+/// * `transactions` - List of transactions to include in the block
+/// * `proposer` - The selected block proposer
+/// * `pos_state` - Current state of the PoS system
+/// 
+/// # Returns
+/// * `Block` - The newly created block
 pub fn produce_block(
     chain: &mut Blockchain,
     transactions: Vec<Transaction>,
@@ -207,7 +265,12 @@ pub fn produce_block(
     }
 }
 
-/// 改良版PoSフロー：VRFベースの選出とスラッシング機能付き
+/// Executes one step of the PoS consensus algorithm
+/// 
+/// # Arguments
+/// * `chain` - The blockchain instance
+/// * `mempool` - Pending transactions to potentially include
+/// * `pos_state` - Current state of the PoS system
 pub fn pos_step(
     chain: &mut Blockchain,
     mempool: Vec<Transaction>,

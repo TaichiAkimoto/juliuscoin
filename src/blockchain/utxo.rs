@@ -1,16 +1,42 @@
+//! UTXO (Unspent Transaction Output) management and validation.
+//! 
+//! This module implements the UTXO model for transaction handling, including:
+//! - Unique UTXO identification
+//! - UTXO set management
+//! - Validator staking and slashing
+//! - Transaction validation
+//! 
+//! The implementation uses a combination of UTXO tracking and validator
+//! management to ensure proper transaction processing and consensus participation.
+
 use sha2::{Digest, Sha256};
 use std::fmt;
 use vrf::{VRF, ECVRF};
 use rand::Rng;
 
+/// Unique identifier for an Unspent Transaction Output (UTXO).
+/// 
+/// UTXOs are identified by their position in the blockchain:
+/// - The block they were created in
+/// - Their transaction index within that block
+/// - Their output index within that transaction
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UtxoId {
+    /// Height of the block containing this UTXO
     pub block_index: u64,
+    /// Index of the transaction within the block
     pub tx_index: u32,
+    /// Index of the output within the transaction
     pub output_index: u32,
 }
 
 impl UtxoId {
+    /// Creates a new UTXO identifier
+    /// 
+    /// # Arguments
+    /// * `block_index` - Height of the containing block
+    /// * `tx_index` - Transaction index in the block
+    /// * `output_index` - Output index in the transaction
     pub fn new(block_index: u64, tx_index: u32, output_index: u32) -> Self {
         Self {
             block_index,
@@ -19,6 +45,10 @@ impl UtxoId {
         }
     }
 
+    /// Creates a UTXO identifier for genesis block outputs
+    /// 
+    /// # Arguments
+    /// * `output_index` - Output index in the genesis transaction
     pub fn genesis(output_index: u32) -> Self {
         Self {
             block_index: 0,
@@ -27,6 +57,11 @@ impl UtxoId {
         }
     }
 
+    /// Creates a UTXO identifier for pending transactions
+    /// 
+    /// # Arguments
+    /// * `tx_index` - Index in the pending transaction pool
+    /// * `output_index` - Output index in the transaction
     pub fn pending(tx_index: u32, output_index: u32) -> Self {
         Self {
             block_index: u64::MAX, // pending transactions use max value to distinguish
@@ -35,7 +70,10 @@ impl UtxoId {
         }
     }
 
-    // UTXOのIDをハッシュ化して16進数文字列として返す
+    /// Computes a unique hash string for this UTXO
+    /// 
+    /// # Returns
+    /// * `String` - SHA-256 hash of the UTXO identifier
     pub fn to_hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.block_index.to_be_bytes());
@@ -83,29 +121,49 @@ mod tests {
     }
 }
 
+/// Represents a validator in the PoS system
 #[derive(Debug, Clone)]
 pub struct Validator {
+    /// Post-quantum address of the validator
     pub address: Address,
+    /// Amount of coins staked by the validator
     pub stake_amount: u64,
+    /// VRF secret key for block proposer selection
     pub vrf_secret_key: [u8; 32],
+    /// Whether the validator has been slashed
     pub slashed: bool,
 }
 
+/// Evidence of validator misbehavior for slashing
 #[derive(Debug, Clone)]
 pub struct SlashingEvidence {
+    /// Address of the misbehaving validator
     pub validator: Address,
+    /// Block height where the offense occurred
     pub block_height: u64,
+    /// Type of slashable offense
     pub evidence_type: SlashingType,
+    /// Cryptographic proof of misbehavior
     pub proof: Vec<u8>,
 }
 
+/// Types of slashable offenses
 #[derive(Debug, Clone)]
 pub enum SlashingType {
+    /// Proposing multiple blocks at the same height
     DoubleProposal,
+    /// Voting for conflicting blocks
     DoubleVoting,
 }
 
 impl UTXOSet {
+    /// Selects the next block proposer using VRF
+    /// 
+    /// # Arguments
+    /// * `seed` - Random seed for VRF (usually previous block hash)
+    /// 
+    /// # Returns
+    /// * `Option<Address>` - Address of the selected proposer, if any
     pub fn select_proposer(&self, seed: &[u8]) -> Option<Address> {
         let validators = self.get_validators();
         if validators.is_empty() {
@@ -135,6 +193,13 @@ impl UTXOSet {
         validator_scores.first().map(|(addr, _)| addr.clone())
     }
 
+    /// Slashes a validator for misbehavior
+    /// 
+    /// # Arguments
+    /// * `evidence` - Evidence of validator misbehavior
+    /// 
+    /// # Returns
+    /// * `Result<(), String>` - Ok if slashing succeeded, Err with message if failed
     pub fn slash_validator(&mut self, evidence: SlashingEvidence) -> Result<(), String> {
         let validator = self.get_validator(&evidence.validator)
             .ok_or("Validator not found")?;
@@ -160,6 +225,11 @@ impl UTXOSet {
         Ok(())
     }
 
+    /// Reduces a validator's stake by the specified amount
+    /// 
+    /// # Arguments
+    /// * `validator` - Address of the validator to slash
+    /// * `amount` - Amount of stake to slash
     fn slash_amount(&mut self, validator: &Address, amount: u64) -> Result<(), String> {
         // スラッシュされた金額を特別なアドレス（バーン用）に送信
         let burn_address = Address::from_string("BURN_ADDRESS")?;
@@ -167,6 +237,10 @@ impl UTXOSet {
         Ok(())
     }
 
+    /// Marks a validator as slashed, preventing future participation
+    /// 
+    /// # Arguments
+    /// * `validator` - Address of the validator to mark as slashed
     fn mark_validator_slashed(&mut self, validator: &Address) -> Result<(), String> {
         // バリデータのスラッシュフラグを設定
         if let Some(validator_data) = self.validators.get_mut(validator) {
@@ -178,7 +252,13 @@ impl UTXOSet {
     }
 }
 
-// ヘルパー関数：ハッシュ値を0-1の範囲の浮動小数点数に変換
+/// Converts a byte array hash to a float value between 0 and 1
+/// 
+/// # Arguments
+/// * `hash` - Byte array to convert
+/// 
+/// # Returns
+/// * `f64` - Float value between 0 and 1
 fn hash_to_float(hash: &[u8]) -> f64 {
     let mut value: u64 = 0;
     for &byte in hash.iter().take(8) {
