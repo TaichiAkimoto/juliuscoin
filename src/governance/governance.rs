@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::cryptography::crypto::PQAddress;
 
 /// JIP (Julius Improvement Proposal) の状態
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum JIPStatus {
     Draft,
     Proposed,
