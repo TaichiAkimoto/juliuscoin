@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use vrf::openssl::ECVRF;
+use vrf::openssl::{ECVRF, CipherSuite, Error as VRFError};
 use crate::blockchain::consensus::slashing::{SlashingReason, SlashingRecord};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -24,14 +24,14 @@ pub struct PoSState {
 }
 
 impl PoSState {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Result<Self, VRFError> {
+        Ok(Self {
             stakers: HashMap::new(),
-            vrf: ECVRF::new(),
+            vrf: ECVRF::from_suite(CipherSuite::SECP256K1_SHA256_TAI)?,
             slashing_records: Vec::new(),
             last_checkpoint_height: 0,
             checkpoint_interval: 100,
-        }
+        })
     }
 
     pub fn slash_staker(&mut self, staker_address: &[u8], reason: SlashingReason, block_height: u64) {

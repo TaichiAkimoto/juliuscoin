@@ -2,10 +2,10 @@ use vrf::openssl::{CipherSuite, ECVRF};
 use vrf::VRF;
 use crate::blockchain::consensus::staking::Staker;
 
-pub fn select_proposer<'a, PK, SK>(
+pub fn select_proposer<'a>(
     stakers: &'a [&'a Staker], 
     seed: &[u8], 
-    vrf: &impl VRF<PK, SK>
+    vrf: &mut ECVRF
 ) -> Option<&'a Staker> {
     let total_stake: u64 = stakers.iter().map(|s| s.stake_amount).sum();
     if total_stake == 0 {
@@ -16,10 +16,13 @@ pub fn select_proposer<'a, PK, SK>(
     let mut selected = None;
 
     for staker in stakers {
+        // Convert the secret key to the appropriate format
         if let Ok(proof) = vrf.prove(&staker.secret_key, seed) {
-            let hash = proof.hash();
+            // Use the proof directly as bytes for the hash
+            let hash = &proof[..8]; // Take first 8 bytes of the proof
+            
             // Map VRF output to 0-1 range
-            let vrf_value = u64::from_be_bytes(hash[0..8].try_into().unwrap()) as f64 
+            let vrf_value = u64::from_be_bytes(hash.try_into().unwrap()) as f64 
                 / u64::MAX as f64;
             
             // Weight by stake amount

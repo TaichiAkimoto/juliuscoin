@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut wallet = Wallet::new();
     let mut network = P2PNetwork::new().await?;
     let mut governance = Governance::new();
-    let mut pos_state = PoSState::new();
+    let mut pos_state = PoSState::new().expect("Failed to initialize PoS state");
     let mempool = Vec::new();
 
     // Start network services
