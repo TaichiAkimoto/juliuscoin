@@ -40,14 +40,15 @@ impl Wallet {
         let public_key = keypair.public.to_bytes().to_vec();
         let secret_key = keypair.secret.to_bytes().to_vec();
         let address_hash = derive_address_from_pk(&public_key);
+        let path = PathBuf::from("wallet.dat");
 
         Self {
             public_key,
             secret_key,
             address_hash,
             mnemonic: None,
-            path: PathBuf::new(),
-            storage: WalletStorage::new(PathBuf::new()),
+            path: path.clone(),
+            storage: WalletStorage::new(path.to_str().unwrap()),
         }
     }
 
@@ -56,14 +57,15 @@ impl Wallet {
         let seed = mnemonic.to_seed();
         let (pk, sk) = generate_dilithium_keypair();
         let address_hash = derive_address_from_pk(&pk);
+        let path = PathBuf::from("wallet.dat");
 
         Ok(Self {
             public_key: pk,
             secret_key: sk,
             address_hash,
             mnemonic: Some(mnemonic.as_str().to_string()),
-            path: PathBuf::new(),
-            storage: WalletStorage::new(PathBuf::new()),
+            path: path.clone(),
+            storage: WalletStorage::new(path.to_str().unwrap()),
         })
     }
 

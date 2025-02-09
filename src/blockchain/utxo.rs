@@ -171,12 +171,13 @@ impl UTXOSet {
             return None;
         }
 
+        let vrf = ECVRF::from_suite(vrf::CipherSuite::SECP256K1_SHA256_TAI).unwrap();
+        
         // VRFを使用して各バリデータのランダム値を生成
         let mut validator_scores: Vec<(Address, f64)> = validators
             .iter()
             .filter(|v| !v.slashed) // スラッシュされたバリデータを除外
             .map(|validator| {
-                let vrf = ECVRF::new(&Sha256::default());
                 let proof = vrf.prove(&validator.vrf_secret_key, seed).unwrap();
                 let hash = vrf.proof_to_hash(&proof).unwrap();
                 

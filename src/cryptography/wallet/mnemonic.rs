@@ -62,12 +62,12 @@ impl Mnemonic {
     }
 
     pub fn to_seed(&self) -> Vec<u8> {
-        use pbkdf2::{pbkdf2_hmac_array, Pbkdf2};
+        use pbkdf2::pbkdf2_hmac_array;
         use hmac::Hmac;
         use sha2::Sha512;
         
         let salt = b"mnemonic";
-        let seed: [u8; 64] = pbkdf2_hmac_array::<Hmac<Sha512>>(
+        let seed: [u8; 64] = pbkdf2_hmac_array::<Hmac<Sha512>, 64>(
             self.phrase.as_bytes(),
             salt,
             2048,

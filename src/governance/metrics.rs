@@ -48,13 +48,15 @@ impl CryptoMetrics {
     pub fn record_operation_time(&mut self, is_signing: bool, duration: Duration) {
         self.total_operations += 1;
         if is_signing {
-            let total_nanos = self.avg_sign_time.as_nanos().saturating_mul(self.total_operations - 1)
+            let total_nanos = self.avg_sign_time.as_nanos()
+                .saturating_mul((self.total_operations - 1) as u128)
                 .saturating_add(duration.as_nanos());
-            self.avg_sign_time = Duration::from_nanos((total_nanos / self.total_operations) as u64);
+            self.avg_sign_time = Duration::from_nanos((total_nanos / (self.total_operations as u128)) as u64);
         } else {
-            let total_nanos = self.avg_verify_time.as_nanos().saturating_mul(self.total_operations - 1)
+            let total_nanos = self.avg_verify_time.as_nanos()
+                .saturating_mul((self.total_operations - 1) as u128)
                 .saturating_add(duration.as_nanos());
-            self.avg_verify_time = Duration::from_nanos((total_nanos / self.total_operations) as u64);
+            self.avg_verify_time = Duration::from_nanos((total_nanos / (self.total_operations as u128)) as u64);
         }
     }
 
