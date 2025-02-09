@@ -1,88 +1,71 @@
-mod crypto;
-mod chain;
-mod consensus;
-mod wallet;
-
-use crate::chain::{Transaction, TxInput, TxOutput};
-use crate::consensus::{Staker, pos_step};
-use crate::wallet::Wallet;
-use crate::chain::Blockchain;
+use juliuscoin::{
+    blockchain::chain::{Blockchain, Transaction},
+    blockchain::consensus::PoSState,
+    cryptography::wallet::Wallet,
+    network::P2PNetwork,
+    governance::Governance,
+    governance::JIPStatus
+};
 use log::info;
+use anyhow::Result;
+use std::error::Error;
 
 /// メイン関数
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     // ログ初期化
     env_logger::init();
     info!("=== Julius Coin MVPノードを起動します ===");
 
-    // (1) ブロックチェーン初期化
+    // Initialize components
     let mut chain = Blockchain::new();
+    let _wallet = Wallet::new();
+    let _network = P2PNetwork::new();
+    let mut governance = Governance::new(1000, 1000); // Minimum stake and voting period
+    let mut pos_state = PoSState::new().expect("Failed to initialize PoS state");
+    let mempool: Vec<Transaction> = Vec::new();
 
-    // (2) ウォレットがない場合は新規作成
-    //     実際にはCLI引数や設定ファイルから複数ウォレットを扱う想定です
-    let wallet_path = "wallet.bin";
-    let my_wallet = if std::path::Path::new(wallet_path).exists() {
-        info!("既存ウォレットを読み込み: {}", wallet_path);
-        Wallet::load_from_file(wallet_path)
-    } else {
-        info!("新規ウォレットを生成");
-        let w = Wallet::new();
-        w.save_to_file(wallet_path);
-        w
-    };
+    // Main blockchain loop
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    info!("自分のアドレスHash = {}", hex::encode(&my_wallet.address_hash));
+        // Process pending transactions
+        if let Some(tx) = mempool.first() {
+            if chain.apply_transaction(tx) {
+                info!("Transaction processed successfully");
+            }
+        }
 
-    // (3) ステーカー一覧を準備: ここでは自分だけをステーカーとする
-    let my_staker = Staker {
-        address_hash: my_wallet.address_hash.clone(),
-        stake_amount: 1000,  // 適当なステーク量(自分が選ばれやすくなる)
-        public_key: my_wallet.public_key.clone(),
-        secret_key: my_wallet.secret_key.clone(),
-    };
-    let stakers = vec![my_staker];
+        // Process governance proposals
+        // First collect the voting JIPs
+        let voting_jips: Vec<_> = governance.jips.values()
+            .filter(|j| j.status == JIPStatus::Voting)
+            .map(|j| j.id)
+            .collect();
+        
+        // Then process them
+        for jip_id in voting_jips {
+            if let Ok(status) = governance.tally_votes(jip_id, 1000) { // Using 1000 as total stake for MVP
+                info!("JIP {} status updated to {:?}", jip_id, status);
+            }
+        }
 
-    // (4) 適当なトランザクションを1つ作ってみる: 自分から自分への送金（MVP用のテスト）
-    // 実際にはUTXOを取得 → TxInputを構成 → 署名 → TxOutput
-    // ここではGenesis直後でUTXOが無いので、擬似的にインプットをでっちあげる
-    let pseudo_input_id = "genesis-utxo-0".to_string();
+        // Update validator set
+        let stakers: Vec<_> = pos_state.stakers.values().collect();
+        for staker in stakers {
+            if staker.stake_amount > 1000 {
+                info!("Validator {} active with stake {}", 
+                    hex::encode(&staker.address_hash), 
+                    staker.stake_amount
+                );
+            }
+        }
 
-    // TxInputを生成: 署名を作る
-    let tx_dummy = Transaction {
-        inputs: vec![{
-            let mut inp = TxInput {
-                utxo_id: pseudo_input_id.clone(),
-                sig: vec![],
-                pub_key: my_wallet.public_key.clone(),
-            };
-            // トランザクション全体をシリアライズして署名
-            let tx_bytes = bincode::serialize(&(
-                pseudo_input_id.clone()
-            )).unwrap();
-            let signature = crypto::sign_message(&tx_bytes, &my_wallet.secret_key);
-            inp.sig = signature;
-            inp
-        }],
-        outputs: vec![TxOutput {
-            amount: 500,
-            recipient_hash: my_wallet.address_hash.clone(),
-        }],
-    };
-
-    // (5) PoSステップでブロック生成
-    info!("トランザクションを含むブロック生成を試みます...");
-    let mempool = vec![tx_dummy];
-    pos_step(&mut chain, mempool, &stakers);
-
-    // 結果表示
-    info!("チェーンのブロック数: {}", chain.blocks.len());
-    for (i, b) in chain.blocks.iter().enumerate() {
-        info!("Block #{} => Tx数: {}", b.index, b.transactions.len());
-        if i == 0 {
-            info!("(Genesis Block)");
+        // Consensus step
+        if let Some(block) = chain.propose_block(&mut pos_state) {
+            if chain.add_block(block) {
+                info!("New block added to chain");
+            }
         }
     }
-
-    // (6) 簡易CLIループなど入れても良いが、MVPなので終了
-    info!("=== Julius Coin MVP完了 ===");
 }
