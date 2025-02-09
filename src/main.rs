@@ -2,15 +2,19 @@ mod crypto;
 mod chain;
 mod consensus;
 mod wallet;
+mod network;
 
 use crate::chain::{Transaction, TxInput, TxOutput};
 use crate::consensus::{Staker, pos_step};
 use crate::wallet::Wallet;
 use crate::chain::Blockchain;
 use log::info;
+use network::P2PNetwork;
+use anyhow::Result;
 
 /// メイン関数
-fn main() {
+#[tokio::main]
+async fn main() -> Result<()> {
     // ログ初期化
     env_logger::init();
     info!("=== Julius Coin MVPノードを起動します ===");
@@ -85,4 +89,11 @@ fn main() {
 
     // (6) 簡易CLIループなど入れても良いが、MVPなので終了
     info!("=== Julius Coin MVP完了 ===");
+
+    // P2Pネットワークを起動
+    let network = P2PNetwork::new(8333);
+    println!("P2Pネットワークを起動します...");
+    network.start().await?;
+
+    Ok(())
 }
