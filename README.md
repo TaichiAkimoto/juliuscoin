@@ -8,7 +8,45 @@ A blockchain implementation in Rust featuring:
 
 ## Prerequisites
 
-- Rust and Cargo (latest stable version)
+- Rust (1.70.0 or later) and Cargo
+
+  ```bash
+  # Check your Rust version
+  rustc --version
+
+  # Update Rust if needed
+  rustup update stable
+  ```
+
+- OpenSSL development packages
+  - For macOS: `brew install openssl`
+  - For Ubuntu/Debian: `sudo apt-get install libssl-dev`
+  - For Fedora: `sudo dnf install openssl-devel`
+
+## Environment Setup
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/yourusername/juliuscoin.git
+   cd juliuscoin
+   ```
+
+2. Install dependencies:
+
+   ```bash
+   cargo build
+   ```
+
+3. Set up logging (optional):
+
+   ```bash
+   # For macOS/Linux
+   export RUST_LOG=debug
+
+   # For Windows PowerShell
+   $env:RUST_LOG="debug"
+   ```
 
 ## Cryptographic Performance Metrics
 
@@ -227,3 +265,76 @@ MIT License
 ## 免責事項
 
 このプロジェクトは実験的な実装であり、実運用での使用は推奨されません。
+
+## Example Output
+
+When you run the node, you should see output similar to this:
+
+```
+=== Julius Coin MVPノードを起動します ===
+[2024-03-xx xx:xx:xx INFO] 新規ウォレットを生成
+[2024-03-xx xx:xx:xx INFO] 自分のアドレスHash = 7f8e9d...
+[2024-03-xx xx:xx:xx INFO] トランザクションを含むブロック生成を試みます...
+[2024-03-xx xx:xx:xx INFO] チェーンのブロック数: 2
+[2024-03-xx xx:xx:xx INFO] Block #0 => Tx数: 0
+[2024-03-xx xx:xx:xx INFO] (Genesis Block)
+[2024-03-xx xx:xx:xx INFO] Block #1 => Tx数: 1
+[2024-03-xx xx:xx:xx INFO] P2Pネットワークを起動します...
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Build Fails with Crypto-Related Errors**
+
+   ```
+   error: failed to run custom build command for `pqcrypto-dilithium`
+   ```
+
+   Solution: Make sure you have OpenSSL development packages installed (see Prerequisites section).
+
+2. **P2P Network Connection Issues**
+
+   ```
+   Error: Address already in use (os error 48)
+   ```
+
+   Solution: Change the P2P port using the P2P_PORT environment variable:
+
+   ```bash
+   P2P_PORT=8334 cargo run
+   ```
+
+3. **Wallet Loading Errors**
+
+   ```
+   Error: Failed to load wallet from file
+   ```
+
+   Solution: Delete the existing wallet file and let the system create a new one:
+
+   ```bash
+   rm wallet.bin
+   cargo run
+   ```
+
+4. **High CPU Usage During Block Creation**
+   This is normal during the Proof of Stake calculations and cryptographic operations. The system will stabilize after block creation.
+
+### Performance Optimization
+
+For better performance, you can build in release mode:
+
+```bash
+cargo build --release
+cargo run --release
+```
+
+### Debug Mode
+
+For detailed logging and debugging:
+
+```bash
+RUST_LOG=debug RUST_BACKTRACE=1 cargo run
+```
