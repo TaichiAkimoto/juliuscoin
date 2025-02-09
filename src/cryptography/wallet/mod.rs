@@ -3,9 +3,9 @@ mod storage;
 
 use std::path::PathBuf;
 use thiserror::Error;
-use crate::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk};
+use crate::cryptography::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk};
 use bincode::{deserialize, serialize};
-use ed25519_dalek::{Keypair, PublicKey, SecretKey};
+use ed25519_dalek::v3::{Keypair, PublicKey, SecretKey};
 use std::fs;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
@@ -25,20 +25,13 @@ pub enum WalletError {
     InvalidMnemonic(String),
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct WalletData {
-    pub public_key: Vec<u8>,
-    pub secret_key: Vec<u8>,
-    pub address_hash: Vec<u8>,
-    pub mnemonic: Option<String>,
-}
-
 pub struct Wallet {
     pub public_key: Vec<u8>,
     pub secret_key: Vec<u8>,
     pub address_hash: Vec<u8>,
     mnemonic: Option<String>,
     path: PathBuf,
+    storage: WalletStorage,
 }
 
 impl Wallet {
@@ -54,6 +47,7 @@ impl Wallet {
             address_hash,
             mnemonic: None,
             path: PathBuf::new(),
+            storage: WalletStorage::new(PathBuf::new()),
         }
     }
 
@@ -69,6 +63,7 @@ impl Wallet {
             address_hash,
             mnemonic: Some(mnemonic.as_str().to_string()),
             path: PathBuf::new(),
+            storage: WalletStorage::new(PathBuf::new()),
         })
     }
 

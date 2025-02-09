@@ -51,6 +51,6 @@ pub mod governance {
 pub mod cli;
 
 // Re-exports for commonly used items
-pub use blockchain::{chain::*, consensus::*, utxo::*};
+pub use blockchain::{chain::*, utxo::*};
 pub use cryptography::{crypto::*, wallet::*};
 pub use governance::{governance::*, metrics::*}; 

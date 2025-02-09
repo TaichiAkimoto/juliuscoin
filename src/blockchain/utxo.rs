@@ -11,8 +11,9 @@
 
 use sha2::{Digest, Sha256};
 use std::fmt;
-use vrf::{VRF, ECVRF};
+use vrf::openssl::ECVRF;
 use rand::Rng;
+use crate::cryptography::crypto::PQAddress as Address;
 
 /// Unique identifier for an Unspent Transaction Output (UTXO).
 /// 
