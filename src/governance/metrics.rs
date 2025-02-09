@@ -4,6 +4,7 @@ use log::info;
 
 /// 暗号操作のサイズ統計
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct CryptoMetrics {
     // Dilithium関連
     pub dilithium_pubkey_size: usize,
@@ -22,6 +23,7 @@ pub struct CryptoMetrics {
 }
 
 impl CryptoMetrics {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             dilithium_pubkey_size: 0,
@@ -36,15 +38,18 @@ impl CryptoMetrics {
         }
     }
 
+    #[allow(dead_code)]
     pub fn record_key_sizes(&mut self, pk: &[u8], sk: &[u8]) {
         self.dilithium_pubkey_size = pk.len();
         self.dilithium_secret_key_size = sk.len();
     }
 
+    #[allow(dead_code)]
     pub fn record_signature_size(&mut self, sig: &[u8]) {
         self.dilithium_signature_size = sig.len();
     }
 
+    #[allow(dead_code)]
     pub fn record_operation_time(&mut self, is_signing: bool, duration: Duration) {
         self.total_operations += 1;
         if is_signing {
@@ -60,6 +65,7 @@ impl CryptoMetrics {
         }
     }
 
+    #[allow(dead_code)]
     pub fn print_stats(&self) {
         info!("=== 量子耐性暗号メトリクス ===");
         info!("Dilithium公開鍵サイズ: {} bytes", self.dilithium_pubkey_size);
@@ -80,6 +86,7 @@ impl CryptoMetrics {
 
 /// ブロックサイズとトランザクション統計
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct BlockMetrics {
     pub total_block_size: usize,
     pub signature_data_size: usize,
@@ -89,6 +96,7 @@ pub struct BlockMetrics {
 }
 
 impl BlockMetrics {
+    #[allow(dead_code)]
     pub fn calculate_sizes(block_data: &[u8], signatures_data: &[u8]) -> Self {
         Self {
             total_block_size: block_data.len(),
@@ -99,6 +107,7 @@ impl BlockMetrics {
         }
     }
 
+    #[allow(dead_code)]
     pub fn print_stats(&self) {
         info!("=== ブロックメトリクス ===");
         info!("総ブロックサイズ: {} KB", self.total_block_size / 1024);

@@ -185,6 +185,26 @@ impl UTXOSet {
         // Implementation needed
         Ok(())
     }
+
+    /// Get a UTXO by its ID
+    pub fn get_utxo(&self, id: &UtxoId) -> Option<&UTXO> {
+        self.utxos.get(id)
+    }
+
+    /// Add a new UTXO to the set
+    pub fn add_utxo(&mut self, id: UtxoId, utxo: UTXO) {
+        self.utxos.insert(id, utxo);
+    }
+
+    /// Remove a UTXO from the set
+    pub fn remove_utxo(&mut self, id: &UtxoId) -> Option<UTXO> {
+        self.utxos.remove(id)
+    }
+
+    /// Get all UTXOs in the set
+    pub fn get_all_utxos(&self) -> &HashMap<UtxoId, UTXO> {
+        &self.utxos
+    }
 }
 
 impl UTXOSet {
