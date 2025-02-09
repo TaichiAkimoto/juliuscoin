@@ -19,8 +19,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Initialize components
     let mut chain = Blockchain::new();
-    let mut wallet = Wallet::new();
-    let mut network = P2PNetwork::new();
+    let _wallet = Wallet::new();
+    let _network = P2PNetwork::new();
     let mut governance = Governance::new(1000, 1000); // Minimum stake and voting period
     let mut pos_state = PoSState::new().expect("Failed to initialize PoS state");
     let mempool: Vec<Transaction> = Vec::new();
@@ -37,9 +37,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Process governance proposals
-        if let Some(jip) = governance.jips.values().find(|j| j.status == JIPStatus::Voting) {
-            if let Ok(status) = governance.tally_votes(jip.id, 1000) { // Using 1000 as total stake for MVP
-                info!("JIP {} status updated to {:?}", jip.id, status);
+        // First collect the voting JIPs
+        let voting_jips: Vec<_> = governance.jips.values()
+            .filter(|j| j.status == JIPStatus::Voting)
+            .map(|j| j.id)
+            .collect();
+        
+        // Then process them
+        for jip_id in voting_jips {
+            if let Ok(status) = governance.tally_votes(jip_id, 1000) { // Using 1000 as total stake for MVP
+                info!("JIP {} status updated to {:?}", jip_id, status);
             }
         }
 
