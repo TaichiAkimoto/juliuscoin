@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
-use crate::governance::governance::{Governance, JIPType, JIPStatus, VoteType};
-use crate::cryptography::crypto::PQAddress;
+use juliuscoin::{
+    Governance, JIPType, JIPStatus, VoteType,
+    cryptography::crypto::PQAddress
+};
 use log::info;
 
 #[derive(Parser)]
@@ -11,7 +13,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Commands {
+pub enum Commands {
     /// JIPの提案
     Propose {
         /// 提案のタイトル

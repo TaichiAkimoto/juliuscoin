@@ -23,34 +23,24 @@ use juliuscoin::{blockchain, cryptography, networking};
 */
 
 /// Core blockchain functionality including chain management and consensus.
-pub mod blockchain {
-    pub mod chain;
-    pub mod consensus;
-    pub mod utxo;
-}
+pub mod blockchain;
 
 /// Cryptographic primitives and wallet management using post-quantum algorithms.
 /// Implements Dilithium for signatures and Kyber for key encapsulation.
-pub mod cryptography {
-    pub mod crypto;
-    pub mod wallet;
-}
+pub mod cryptography;
 
 /// Networking infrastructure for P2P communication between nodes.
-pub mod networking {
-    // Network related modules
-}
+pub mod network;
 
 /// On-chain governance mechanisms and network metrics collection.
-pub mod governance {
-    pub mod metrics;
-    pub mod governance;
-}
+pub mod governance;
 
 /// Command-line interface for interacting with the blockchain.
 pub mod cli;
 
-// Re-exports for commonly used items
-pub use blockchain::{chain::*, utxo::*};
-pub use cryptography::{crypto::*, wallet::*};
-pub use governance::{governance::*, metrics::*}; 
+// Re-export commonly used types
+pub use blockchain::chain::{Transaction, TxInput, TxOutput, Blockchain};
+pub use blockchain::consensus::{PoSState, Staker};
+pub use cryptography::wallet::Wallet;
+pub use governance::governance::{Governance, JIPType, JIPStatus, VoteType};
+pub use network::p2p::P2PNetwork; 

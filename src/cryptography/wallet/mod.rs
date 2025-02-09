@@ -27,6 +27,7 @@ pub struct Wallet {
     pub secret_key: Vec<u8>,
     pub address_hash: Vec<u8>,
     mnemonic: Option<String>,
+    #[allow(dead_code)]
     path: PathBuf,
     storage: WalletStorage,
 }
