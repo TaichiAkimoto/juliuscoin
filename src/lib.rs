@@ -42,5 +42,5 @@ pub mod cli;
 pub use blockchain::chain::{Transaction, TxInput, TxOutput, Blockchain};
 pub use blockchain::consensus::{PoSState, Staker};
 pub use cryptography::wallet::Wallet;
-pub use governance::governance::{Governance, JIPType, JIPStatus, VoteType};
-pub use network::p2p::P2PNetwork; 
+pub use governance::{Governance, JIPType, JIPStatus, VoteType};
+pub use network::P2PNetwork; 
