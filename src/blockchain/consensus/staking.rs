@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use vrf::ECVRF;
+use vrf::openssl::ECVRF;
 use crate::blockchain::consensus::slashing::{SlashingReason, SlashingRecord};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -62,14 +62,20 @@ impl PoSState {
             
             let offline_threshold = 24 * 60 * 60; // 24 hours
             
-            for (address, staker) in self.stakers.iter() {
-                if current_time - staker.last_active_time > offline_threshold {
-                    self.slash_staker(
-                        address,
-                        SlashingReason::Offline,
-                        block_height,
-                    );
-                }
+            // Collect addresses that need slashing first
+            let addresses_to_slash: Vec<_> = self.stakers
+                .iter()
+                .filter(|(_, staker)| current_time - staker.last_active_time > offline_threshold)
+                .map(|(addr, _)| addr.clone())
+                .collect();
+            
+            // Then perform slashing
+            for address in addresses_to_slash {
+                self.slash_staker(
+                    &address,
+                    SlashingReason::Offline,
+                    block_height,
+                );
             }
             
             true

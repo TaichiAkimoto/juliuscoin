@@ -1,5 +1,4 @@
 use serde::{Serialize, Deserialize};
-use log::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SlashingReason {

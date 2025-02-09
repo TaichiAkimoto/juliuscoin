@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
-use crate::cryptography::wallet::{Wallet, WalletError, Mnemonic};
+use crate::cryptography::wallet::{Wallet, WalletError};
 
 #[derive(Serialize, Deserialize)]
 pub struct WalletData {

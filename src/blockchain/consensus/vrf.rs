@@ -1,7 +1,12 @@
-use vrf::{VRFProof, VRF};
+use vrf::openssl::{CipherSuite, ECVRF};
+use vrf::VRF;
 use crate::blockchain::consensus::staking::Staker;
 
-pub fn select_proposer(stakers: &[&Staker], seed: &[u8], vrf: &impl VRF) -> Option<&Staker> {
+pub fn select_proposer<'a, PK, SK>(
+    stakers: &'a [&'a Staker], 
+    seed: &[u8], 
+    vrf: &impl VRF<PK, SK>
+) -> Option<&'a Staker> {
     let total_stake: u64 = stakers.iter().map(|s| s.stake_amount).sum();
     if total_stake == 0 {
         return None;
