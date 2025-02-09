@@ -1,11 +1,10 @@
 use juliuscoin::{
-    blockchain::chain::Blockchain,
-    blockchain::utxo::Transaction,
-    blockchain::consensus::{PoSState, Staker},
+    blockchain::chain::{Blockchain, Transaction},
+    blockchain::consensus::PoSState,
     cryptography::wallet::Wallet,
     network::P2PNetwork,
     governance::Governance,
-    governance::{JIPStatus, JIPType, VoteType}
+    governance::JIPStatus
 };
 use log::info;
 use anyhow::Result;
@@ -20,7 +19,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Initialize components
     let mut chain = Blockchain::new();
-    let mut wallet = Wallet::new()?;
+    let mut wallet = Wallet::new();
     let mut network = P2PNetwork::new();
     let mut governance = Governance::new(1000, 1000); // Minimum stake and voting period
     let mut pos_state = PoSState::new().expect("Failed to initialize PoS state");
@@ -38,8 +37,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Process governance proposals
-        if let Some(proposal) = governance.proposals.iter().find(|p| p.status == JIPStatus::Voting) {
-            governance.update_proposal_status(proposal.id);
+        if let Some(jip) = governance.jips.values().find(|j| j.status == JIPStatus::Voting) {
+            if let Ok(status) = governance.tally_votes(jip.id, 1000) { // Using 1000 as total stake for MVP
+                info!("JIP {} status updated to {:?}", jip.id, status);
+            }
         }
 
         // Update validator set

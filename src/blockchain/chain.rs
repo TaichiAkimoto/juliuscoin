@@ -244,6 +244,18 @@ impl Blockchain {
             .unwrap()
             .as_secs();
 
+        // Get stakers for proposer selection
+        let stakers: Vec<_> = pos_state.stakers.values().collect();
+        let staker_refs: Vec<_> = stakers.iter().collect();
+        
+        // Use VRF to select proposer
+        let mut vrf = pos_state.vrf.clone();
+        let proposer = crate::blockchain::consensus::vrf::select_proposer(
+            &staker_refs,
+            &prev_hash,
+            &mut vrf
+        )?;
+
         // For MVP, we're not implementing actual transaction selection
         // In production, this would select transactions from mempool
         let transactions = Vec::new();
@@ -253,7 +265,7 @@ impl Blockchain {
             prev_hash,
             timestamp,
             transactions,
-            proposer_address: Vec::new(), // Should be set to actual proposer
+            proposer_address: proposer.address_hash.clone(),
             block_signature: Vec::new(),  // Should be signed by proposer
         })
     }
