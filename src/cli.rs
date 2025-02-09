@@ -1,8 +1,6 @@
 use clap::{Parser, Subcommand};
-use juliuscoin::{
-    Governance, JIPType, JIPStatus, VoteType,
-    cryptography::crypto::PQAddress
-};
+use crate::governance::governance::{Governance, JIPType, JIPStatus, VoteType};
+use crate::cryptography::crypto::PQAddress;
 use log::info;
 
 #[derive(Parser)]

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use thiserror::Error;
 use crate::cryptography::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk};
 use pqcrypto_traits::sign::{PublicKey, SecretKey};
-use bincode::{deserialize, serialize};
 
 pub use mnemonic::Mnemonic;
 pub use storage::{WalletData, WalletStorage};
