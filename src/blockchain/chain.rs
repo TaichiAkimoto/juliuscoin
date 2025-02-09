@@ -235,7 +235,7 @@ impl Blockchain {
         hasher.finalize().to_vec()
     }
 
-    pub fn propose_block(&self, pos_state: &PoSState) -> Option<Block> {
+    pub fn propose_block(&self, pos_state: &mut PoSState) -> Option<Block> {
         let last_block = self.blocks.last()?;
         let next_index = last_block.index + 1;
         let prev_hash = self.hash_block(last_block);

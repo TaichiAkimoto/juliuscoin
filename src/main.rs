@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Consensus step
-        if let Some(block) = chain.propose_block(&pos_state) {
+        if let Some(block) = chain.propose_block(&mut pos_state) {
             if chain.add_block(block) {
                 info!("New block added to chain");
             }
