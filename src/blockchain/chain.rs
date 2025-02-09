@@ -11,6 +11,7 @@
 
 use serde::{Serialize, Deserialize};
 use crate::cryptography::crypto::{verify_signature, derive_address_from_pk};
+use crate::blockchain::consensus::PoSState;
 use log::info;
 
 /// Represents an Unspent Transaction Output (UTXO) in the blockchain.

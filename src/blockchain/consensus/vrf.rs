@@ -1,4 +1,5 @@
 use vrf::openssl::ECVRF;
+use vrf::VRF;
 use crate::blockchain::consensus::staking::Staker;
 
 pub fn select_proposer<'a>(
@@ -15,8 +16,8 @@ pub fn select_proposer<'a>(
     let mut selected = None;
 
     for staker in stakers {
-        // Convert the secret key to the appropriate format
-        if let Ok(proof) = vrf.prove(&staker.secret_key, seed) {
+        // Convert the secret key to the appropriate format and use VRF trait methods
+        if let Ok(proof) = VRF::prove(vrf, &staker.secret_key, seed) {
             // Use the proof directly as bytes for the hash
             let hash = &proof[..8]; // Take first 8 bytes of the proof
             
