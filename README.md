@@ -11,6 +11,9 @@ A blockchain implementation in Rust featuring:
 - Rust (1.70.0 or later) and Cargo
 
   ```bash
+  # Install Rust and Cargo using rustup (if not already installed)
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
   # Check your Rust version
   rustc --version
 
@@ -19,9 +22,19 @@ A blockchain implementation in Rust featuring:
   ```
 
 - OpenSSL development packages
-  - For macOS: `brew install openssl`
+
+  - For macOS:
+    ```bash
+    brew install openssl
+    export OPENSSL_DIR=$(brew --prefix openssl)
+    ```
   - For Ubuntu/Debian: `sudo apt-get install libssl-dev`
   - For Fedora: `sudo dnf install openssl-devel`
+
+- Git (for cloning the repository)
+  - For macOS: `brew install git`
+  - For Ubuntu/Debian: `sudo apt-get install git`
+  - For Fedora: `sudo dnf install git`
 
 ## Environment Setup
 
@@ -32,13 +45,14 @@ A blockchain implementation in Rust featuring:
    cd juliuscoin
    ```
 
-2. Install dependencies:
+2. Install dependencies and build the project:
 
    ```bash
-   cargo build
+   # This may take a few minutes as it compiles the quantum-resistant cryptography libraries
+   cargo build --release
    ```
 
-3. Set up logging (optional):
+3. Set up logging (optional but recommended for debugging):
 
    ```bash
    # For macOS/Linux
@@ -88,7 +102,11 @@ cargo build
 To run a single node with default settings:
 
 ```bash
+# Development mode
 cargo run
+
+# Production mode (optimized)
+cargo run --release
 ```
 
 ### Multiple Nodes (P2P Testing)
@@ -98,19 +116,19 @@ To test P2P functionality, you can run multiple nodes on different ports:
 Terminal 1 (Default port 8333):
 
 ```bash
-cargo run
+cargo run --release
 ```
 
 Terminal 2 (Port 8334):
 
 ```bash
-P2P_PORT=8334 cargo run
+P2P_PORT=8334 cargo run --release
 ```
 
 Terminal 3 (Port 8335):
 
 ```bash
-P2P_PORT=8335 cargo run
+P2P_PORT=8335 cargo run --release
 ```
 
 ## Logging
@@ -286,55 +304,23 @@ When you run the node, you should see output similar to this:
 
 ### Common Issues
 
-1. **Build Fails with Crypto-Related Errors**
+1. OpenSSL errors:
 
-   ```
-   error: failed to run custom build command for `pqcrypto-dilithium`
-   ```
+   - Make sure OpenSSL is properly installed and environment variables are set
+   - For macOS users: `export OPENSSL_DIR=$(brew --prefix openssl)`
 
-   Solution: Make sure you have OpenSSL development packages installed (see Prerequisites section).
+2. Build failures:
 
-2. **P2P Network Connection Issues**
+   - Try cleaning the build: `cargo clean`
+   - Rebuild with verbose output: `cargo build -v`
 
-   ```
-   Error: Address already in use (os error 48)
-   ```
+3. P2P Connection Issues:
 
-   Solution: Change the P2P port using the P2P_PORT environment variable:
+   - Check if the ports are not in use: `lsof -i :<port_number>`
+   - Ensure your firewall allows the connections
 
-   ```bash
-   P2P_PORT=8334 cargo run
-   ```
+4. Performance Issues:
+   - Use release mode (`--release` flag) for better performance
+   - Monitor system resources during operation
 
-3. **Wallet Loading Errors**
-
-   ```
-   Error: Failed to load wallet from file
-   ```
-
-   Solution: Delete the existing wallet file and let the system create a new one:
-
-   ```bash
-   rm wallet.bin
-   cargo run
-   ```
-
-4. **High CPU Usage During Block Creation**
-   This is normal during the Proof of Stake calculations and cryptographic operations. The system will stabilize after block creation.
-
-### Performance Optimization
-
-For better performance, you can build in release mode:
-
-```bash
-cargo build --release
-cargo run --release
-```
-
-### Debug Mode
-
-For detailed logging and debugging:
-
-```bash
-RUST_LOG=debug RUST_BACKTRACE=1 cargo run
-```
+For additional help or to report issues, please visit the project's GitHub repository.
