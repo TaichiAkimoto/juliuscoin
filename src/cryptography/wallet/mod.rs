@@ -4,6 +4,11 @@ mod storage;
 use std::path::PathBuf;
 use thiserror::Error;
 use crate::crypto::{generate_dilithium_keypair, PQAddress, derive_address_from_pk};
+use bincode::{deserialize, serialize};
+use ed25519_dalek::{Keypair, PublicKey, SecretKey};
+use std::fs;
+use sha2::{Sha256, Digest};
+use serde::{Serialize, Deserialize};
 
 pub use mnemonic::Mnemonic;
 pub use storage::{WalletData, WalletStorage};
@@ -20,27 +25,35 @@ pub enum WalletError {
     InvalidMnemonic(String),
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct WalletData {
+    pub public_key: Vec<u8>,
+    pub secret_key: Vec<u8>,
+    pub address_hash: Vec<u8>,
+    pub mnemonic: Option<String>,
+}
+
 pub struct Wallet {
     pub public_key: Vec<u8>,
     pub secret_key: Vec<u8>,
     pub address_hash: Vec<u8>,
-    mnemonic: Option<Mnemonic>,
-    storage: WalletStorage,
+    mnemonic: Option<String>,
+    path: PathBuf,
 }
 
 impl Wallet {
     pub fn new() -> Self {
-        let mnemonic = Mnemonic::generate();
-        let seed = mnemonic.to_seed();
-        let (pk, sk) = generate_dilithium_keypair();
-        let address_hash = derive_address_from_pk(&pk);
+        let keypair = generate_dilithium_keypair();
+        let public_key = keypair.public.to_bytes().to_vec();
+        let secret_key = keypair.secret.to_bytes().to_vec();
+        let address_hash = derive_address_from_pk(&public_key);
 
         Self {
-            public_key: pk,
-            secret_key: sk,
+            public_key,
+            secret_key,
             address_hash,
-            mnemonic: Some(mnemonic),
-            storage: WalletStorage::new("wallet.bin"),
+            mnemonic: None,
+            path: PathBuf::new(),
         }
     }
 
@@ -54,8 +67,8 @@ impl Wallet {
             public_key: pk,
             secret_key: sk,
             address_hash,
-            mnemonic: Some(mnemonic),
-            storage: WalletStorage::new("wallet.bin"),
+            mnemonic: Some(mnemonic.as_str().to_string()),
+            path: PathBuf::new(),
         })
     }
 
@@ -68,13 +81,10 @@ impl Wallet {
     }
 
     pub fn get_mnemonic(&self) -> Option<&str> {
-        self.mnemonic.as_ref().map(|m| m.as_str())
+        self.mnemonic.as_deref()
     }
 
     pub fn get_address(&self) -> PQAddress {
-        PQAddress {
-            public_key: self.public_key.clone(),
-            hash: self.address_hash.clone(),
-        }
+        PQAddress::new(&self.address_hash)
     }
 } 
