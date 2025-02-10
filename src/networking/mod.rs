@@ -15,6 +15,17 @@ use crate::crypto::{
 use message::Message;
 use serde::{Serialize, Deserialize};
 
+// Added import for Dilithium PQ signature functions
+use crate::cryptography::crypto::{generate_dilithium_keypair, DilithiumKeypair, detached_sign, verify_signature};
+
+// Added handshake message for PQ handshake
+#[derive(Serialize, Deserialize)]
+struct HandshakeMessage {
+    pub kyber_public_key: Vec<u8>,
+    pub dilithium_public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
 mod message;
 pub use message::Message;
 
@@ -32,6 +43,7 @@ struct Peer {
     address: PQAddress,
     shared_secret: Vec<u8>,
     stream: Arc<TcpStream>,
+    dilithium_public_key: Vec<u8>,
 }
 
 /// P2Pネットワーク
@@ -39,47 +51,69 @@ pub struct P2PNetwork {
     port: u16,
     peers: Arc<Mutex<HashMap<Vec<u8>, Peer>>>,
     keypair: (Vec<u8>, Vec<u8>), // Kyber (pk, sk)
+    dilithium_keypair: DilithiumKeypair,
 }
 
 impl P2PNetwork {
     pub fn new(port: u16) -> Self {
         let (pk, sk) = generate_kyber_keypair();
+        let dilithium_keypair = generate_dilithium_keypair();
         Self {
             port,
             peers: Arc::new(Mutex::new(HashMap::new())),
             keypair: (pk, sk),
+            dilithium_keypair,
         }
     }
 
     /// ピアとの接続確立とキー交換
     async fn establish_connection(&self, stream: TcpStream, addr: &str) -> Result<()> {
         let stream = Arc::new(stream);
-        
-        // 1. 自分のKyber公開鍵を送信
         let mut writer = tokio::io::BufWriter::new(stream.clone());
-        tokio::io::AsyncWriteExt::write_all(&mut writer, &self.keypair.0).await?;
+
+        // 1. Send handshake message with Kyber and Dilithium public keys, signed by our Dilithium secret key
+        let mut sign_data = self.keypair.0.clone();
+        sign_data.extend(self.dilithium_keypair.public_key.clone());
+        let signature = detached_sign(&sign_data, &self.dilithium_keypair.secret_key)?;
+        let handshake = HandshakeMessage {
+             kyber_public_key: self.keypair.0.clone(),
+             dilithium_public_key: self.dilithium_keypair.public_key.clone(),
+             signature,
+        };
+        let handshake_bytes = bincode::serialize(&handshake)?;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &handshake_bytes).await?;
         writer.flush().await?;
 
-        // 2. 相手のKyber公開鍵を受信
+        // 2. Read peer's handshake message
         let mut reader = tokio::io::BufReader::new(stream.clone());
-        let mut peer_pk = vec![0u8; self.keypair.0.len()];
-        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut peer_pk).await?;
+        let mut buf = vec![0u8; 512];
+        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
+        buf.truncate(n);
+        let peer_handshake: HandshakeMessage = bincode::deserialize(&buf)?;
 
-        // 3. 共有鍵の確立
-        let (ciphertext, shared_secret) = kyber_encapsulate(&peer_pk);
+        // Verify the peer's handshake signature
+        let mut peer_sign_data = peer_handshake.kyber_public_key.clone();
+        peer_sign_data.extend(peer_handshake.dilithium_public_key.clone());
+        if !verify_signature(&peer_sign_data, &peer_handshake.signature, &peer_handshake.dilithium_public_key) {
+             return Err(anyhow::anyhow!("Peer handshake signature verification failed"));
+        }
 
-        // 4. カプセル化した鍵を送信
+        // 3. Establish shared secret using peer's Kyber public key from the handshake
+        let (ciphertext, shared_secret) = kyber_encapsulate(&peer_handshake.kyber_public_key);
+
+        // 4. Send the encapsulated ciphertext
         writer.write_all(&ciphertext).await?;
         writer.flush().await?;
 
-        // 5. ピア情報を保存
+        // 5. Save the peer information using data from the handshake
         let peer = Peer {
-            address: PQAddress {
-                public_key: peer_pk.clone(),
-                hash: crate::crypto::derive_address_from_pk(&peer_pk),
-            },
-            shared_secret,
-            stream,
+             address: PQAddress {
+                  public_key: peer_handshake.kyber_public_key.clone(),
+                  hash: crate::crypto::derive_address_from_pk(&peer_handshake.kyber_public_key),
+             },
+             shared_secret,
+             stream,
+             dilithium_public_key: peer_handshake.dilithium_public_key,
         };
 
         let mut peers = self.peers.lock().await;
@@ -100,17 +134,33 @@ impl P2PNetwork {
         let nonce = Nonce::from_slice(&[0u8; 12]); // 実際の実装では適切なnonceを生成する
         let encrypted_data = cipher.encrypt(nonce, message_bytes.as_ref())?;
 
-        // 暗号化メッセージを構築
+        // Derive our own sender address from our Kyber public key
+        let my_address = crate::crypto::derive_address_from_pk(&self.keypair.0);
+
+        // Construct the encrypted message with our sender address
         let encrypted_message = EncryptedMessage {
-            sender_address: peer.address.hash.clone(),
+            sender_address: my_address.clone(),
             encrypted_data,
-            kyber_ciphertext: vec![], // 既に共有鍵確立済みなので空
+            kyber_ciphertext: vec![], // Already shared secret established
         };
 
-        // 送信
+        // Serialize the encrypted message
+        let encrypted_message_bytes = bincode::serialize(&encrypted_message)?;
+
+        // Sign the encrypted message bytes using our Dilithium secret key
+        let signature = detached_sign(&encrypted_message_bytes, &self.dilithium_keypair.secret_key)?;
+
+        // Wrap the encrypted message in a SignedMessage for tamper-evidence
+        let signed_message = message::SignedMessage {
+            sender_address: my_address,
+            data: encrypted_message_bytes,
+            signature,
+        };
+
+        // Serialize and send the signed message
+        let signed_message_bytes = bincode::serialize(&signed_message)?;
         let mut writer = tokio::io::BufWriter::new(peer.stream.clone());
-        let message_bytes = bincode::serialize(&encrypted_message)?;
-        writer.write_all(&message_bytes).await?;
+        writer.write_all(&signed_message_bytes).await?;
         writer.flush().await?;
 
         Ok(())

@@ -11,11 +11,84 @@
 
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::collections::{HashMap, VecDeque};
+use serde::{Serialize, Deserialize};
 use vrf::openssl::{ECVRF, CipherSuite};
 use vrf::VRF;
 use crate::cryptography::crypto::PQAddress as Address;
-use std::collections::HashMap;
-use crate::blockchain::chain::UTXO;
+use crate::blockchain::script::Script;
+
+/// Represents an Unspent Transaction Output (UTXO) in the blockchain.
+/// 
+/// UTXOs are the fundamental unit of value in the blockchain, representing
+/// coins that can be spent in future transactions.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct UTXO {
+    /// The amount of coins in this UTXO
+    pub amount: u64,
+    /// Hash of the owner's post-quantum address
+    pub owner_hash: Vec<u8>,
+    /// Script that must be satisfied to spend this UTXO
+    pub locking_script: Script,
+    pub metadata: Option<String>,
+}
+
+impl UTXO {
+    /// Creates a new UTXO with the given amount and owner
+    pub fn new(amount: u64, owner_hash: Vec<u8>, locking_script: Script) -> Self {
+        Self {
+            amount,
+            owner_hash,
+            locking_script,
+            metadata: None,
+        }
+    }
+
+    /// Creates a new P2PKH (Pay to Public Key Hash) UTXO
+    pub fn new_p2pkh(amount: u64, owner_hash: Vec<u8>) -> Self {
+        let mut script = Script::new();
+        script.code = vec![
+            0x76, // OP_DUP
+            0xa8, // OP_SHA256
+            0x88, // OP_EQUALVERIFY
+            0xac, // OP_CHECKSIG
+        ];
+        
+        Self::new(amount, owner_hash, script)
+    }
+
+    /// Creates a new time-locked UTXO that can only be spent after a certain block height
+    pub fn new_timelock(amount: u64, owner_hash: Vec<u8>, unlock_height: u64) -> Self {
+        let mut script = Script::new();
+        script.code = vec![
+            0xb1, // OP_CHECKLOCKTIMEVERIFY
+            0x69, // OP_VERIFY
+        ];
+        
+        Self::new(amount, owner_hash, script)
+    }
+
+    /// Validates the unlocking script against this UTXO's locking script
+    pub fn validate_spend(&self, unlocking_script: &Script, block_height: u64) -> Result<bool, String> {
+        // Combine unlocking and locking scripts
+        let mut combined_script = Script::new();
+        combined_script.code.extend(unlocking_script.code.iter());
+        combined_script.code.extend(self.locking_script.code.iter());
+        
+        // Execute the combined script
+        combined_script.execute(VecDeque::new(), block_height)
+            .map_err(|e| format!("Script execution failed: {}", e))
+    }
+
+    pub fn new_with_metadata(amount: u64, owner_hash: Vec<u8>, locking_script: Script, metadata: String) -> Self {
+        Self {
+            amount,
+            owner_hash,
+            locking_script,
+            metadata: Some(metadata),
+        }
+    }
+}
 
 /// Unique identifier for an Unspent Transaction Output (UTXO).
 /// 
@@ -23,7 +96,7 @@ use crate::blockchain::chain::UTXO;
 /// - The block they were created in
 /// - Their transaction index within that block
 /// - Their output index within that transaction
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UtxoId {
     /// Height of the block containing this UTXO
     pub block_index: u64,
