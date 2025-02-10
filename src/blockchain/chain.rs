@@ -14,6 +14,8 @@ use crate::cryptography::crypto::{verify_signature, derive_address_from_pk};
 use crate::blockchain::consensus::{PoSState, Staker};
 use log::info;
 use std::time::{SystemTime, UNIX_EPOCH};
+use vrf::openssl::{ECVRF, CipherSuite, Error as VRFError};
+use vrf::VRF;
 
 /// Represents an Unspent Transaction Output (UTXO) in the blockchain.
 /// 
@@ -95,6 +97,147 @@ pub struct Block {
     pub proposer_address: Vec<u8>,
     /// Dilithium signature of the block by the proposer
     pub block_signature: Vec<u8>,
+    /// VRF proof for proposer selection
+    pub vrf_proof: Vec<u8>,
+}
+
+// Helper struct for fork detection
+#[derive(Debug, Clone)]
+struct ForkInfo {
+    height: u64,
+    hash: Vec<u8>,
+}
+
+/// Handle for managing Proof of Stake state independently
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PosStateHandle {
+    inner: PoSState,
+}
+
+impl PosStateHandle {
+    pub fn new() -> Result<Self, VRFError> {
+        Ok(Self {
+            inner: PoSState::new()?
+        })
+    }
+
+    pub fn get_finalized_height(&self) -> u64 {
+        self.inner.get_finalized_height()
+    }
+
+    pub fn is_key_allowed_to_stake(&self, public_key: &[u8], height: u64) -> bool {
+        self.inner.is_key_allowed_to_stake(public_key, height)
+    }
+
+    pub fn get_staker(&self, address: &[u8]) -> Option<&Staker> {
+        self.inner.stakers.get(address)
+    }
+
+    pub fn record_proposal(&mut self, height: u64, proposer: &[u8], block_hash: &[u8]) {
+        self.inner.record_proposal(height, proposer, block_hash)
+    }
+
+    pub fn create_checkpoint(&mut self, height: u64) {
+        self.inner.create_checkpoint(height);
+    }
+
+    pub fn should_create_checkpoint(&self, height: u64) -> bool {
+        height > self.inner.last_checkpoint_height + self.inner.checkpoint_interval
+    }
+
+    pub fn validate_unstake(&self, staker_hash: &[u8]) -> bool {
+        self.inner.is_validator(staker_hash)
+    }
+
+    pub fn process_unstake(&mut self, staker_hash: &[u8], amount: u64, height: u64) -> Result<(), String> {
+        self.inner.request_unstake(staker_hash, amount, height)
+    }
+
+    pub fn process_withdrawals(&mut self, height: u64) -> Vec<(Vec<u8>, u64)> {
+        self.inner.process_withdrawals(height)
+    }
+
+    /// Generate VRF proof and output using the provided seed
+    fn generate_vrf_proof_and_output(&mut self, seed: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let vrf = self.inner.vrf.as_mut()?;
+        
+        // Generate VRF proof
+        let proof = vrf.prove(seed, seed).ok()?;
+        
+        // Convert proof to hash
+        let hash = vrf.proof_to_hash(&proof).ok()?;
+        
+        Some((proof, hash))
+    }
+
+    /// Verify a VRF proof
+    pub fn verify_vrf_proof(&self, seed: &[u8], proof: &[u8], expected_hash: &[u8]) -> bool {
+        if let Some(vrf) = &self.inner.vrf {
+            // Create a new VRF instance for verification
+            if let Ok(mut verify_vrf) = ECVRF::from_suite(CipherSuite::SECP256K1_SHA256_TAI) {
+                if let Ok(computed_hash) = verify_vrf.verify(seed, seed, proof) {
+                    return computed_hash == expected_hash;
+                }
+            }
+        }
+        false
+    }
+
+    /// Select a proposer using VRF output
+    pub fn prepare_block_proposal(&mut self, prev_hash: &[u8]) -> Option<(Staker, Vec<u8>)> {
+        // Get VRF proof and output
+        let (proof, vrf_output) = self.generate_vrf_proof_and_output(prev_hash)?;
+        
+        // Convert VRF output to a random value between 0 and 1
+        let random_value = {
+            let mut value = 0u64;
+            for (i, byte) in vrf_output.iter().take(8).enumerate() {
+                value |= (*byte as u64) << (i * 8);
+            }
+            value as f64 / u64::MAX as f64
+        };
+        
+        // Get stakers and calculate total stake
+        let stakers: Vec<&Staker> = self.inner.stakers.values().collect();
+        let total_stake: u64 = stakers.iter().map(|s| s.stake_amount).sum();
+        
+        if total_stake == 0 {
+            return None;
+        }
+
+        // Select proposer based on weighted random selection
+        let mut best_score = 0.0;
+        let mut selected = None;
+
+        for staker in stakers {
+            let weighted_score = random_value * (staker.stake_amount as f64 / total_stake as f64);
+            if weighted_score > best_score {
+                best_score = weighted_score;
+                selected = Some(staker.clone());
+            }
+        }
+
+        selected.map(|s| (s, proof))
+    }
+
+    pub fn initialize_vrf(&mut self) -> Result<(), VRFError> {
+        if self.inner.vrf.is_none() {
+            self.inner.vrf = Some(ECVRF::from_suite(CipherSuite::SECP256K1_SHA256_TAI)?);
+        }
+        Ok(())
+    }
+
+    pub fn stake(&mut self, address_hash: Vec<u8>, amount: u64, public_key: Vec<u8>) -> Result<(), String> {
+        self.inner.stake(address_hash, amount, public_key)
+    }
+
+    pub fn compute_block_hash(&self, block: &Block) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let encoded = bincode::serialize(block).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&encoded);
+        hasher.finalize().to_vec()
+    }
 }
 
 /// The main blockchain structure that manages the chain of blocks and UTXO set.
@@ -104,8 +247,40 @@ pub struct Blockchain {
     pub blocks: Vec<Block>,
     /// Map of UTXO IDs to their corresponding UTXO data
     pub utxos: std::collections::HashMap<String, UTXO>,
-    /// Proof of Stake state
-    pub pos_state: Option<PoSState>,
+    /// Handle to the Proof of Stake state
+    pub pos_handle: Option<PosStateHandle>,
+}
+
+#[derive(Debug)]
+pub enum BlockValidationError {
+    InvalidConnection(String),
+    InvalidFork(String),
+    BelowFinalizedHeight(u64),
+    InvalidProposer(String),
+    InvalidReward(String),
+    InvalidTransaction(String),
+}
+
+/// Validation result for a block
+#[derive(Debug)]
+struct BlockValidationResult {
+    validation: Result<(), BlockValidationError>,
+    checkpoint_needed: bool,
+    block_hash: Vec<u8>,
+    fork_point: Option<u64>,
+    total_fees: u64,
+}
+
+impl Default for BlockValidationResult {
+    fn default() -> Self {
+        Self {
+            validation: Ok(()),
+            checkpoint_needed: false,
+            block_hash: Vec::new(),
+            fork_point: None,
+            total_fees: 0,
+        }
+    }
 }
 
 impl Blockchain {
@@ -118,11 +293,12 @@ impl Blockchain {
             transactions: vec![],
             proposer_address: vec![],
             block_signature: vec![],
+            vrf_proof: Vec::new(),
         };
         Self {
             blocks: vec![genesis_block],
             utxos: std::collections::HashMap::new(),
-            pos_state: PoSState::new().ok(),
+            pos_handle: PosStateHandle::new().ok(),
         }
     }
 
@@ -244,12 +420,8 @@ impl Blockchain {
                 let staker_hash = derive_address_from_pk(&tx.inputs[0].pub_key);
                 
                 // Update PoS state
-                if let Some(pos_state) = &mut self.pos_state {
-                    if let Err(e) = pos_state.stake(
-                        staker_hash.clone(),
-                        total_in,
-                        tx.inputs[0].pub_key.clone(),
-                    ) {
+                if let Some(pos_handle) = &mut self.pos_handle {
+                    if let Err(e) = pos_handle.process_unstake(&staker_hash, total_in, self.blocks.len() as u64) {
                         info!("Staking failed: {}", e);
                         return false;
                     }
@@ -263,7 +435,7 @@ impl Blockchain {
                 let staker_hash = derive_address_from_pk(&tx.inputs[0].pub_key);
                 let current_height = self.blocks.len() as u64;
                 
-                let pos_state = match &mut self.pos_state {
+                let pos_handle = match &mut self.pos_handle {
                     Some(state) => state,
                     None => {
                         info!("PoS state not initialized");
@@ -272,13 +444,13 @@ impl Blockchain {
                 };
 
                 // Request unstake
-                if let Err(e) = pos_state.request_unstake(&staker_hash, total_in, current_height) {
+                if let Err(e) = pos_handle.process_unstake(&staker_hash, total_in, current_height) {
                     info!("Unstaking request failed: {}", e);
                     return false;
                 }
 
                 // Process any mature withdrawals
-                let processed_withdrawals = pos_state.process_withdrawals(current_height);
+                let processed_withdrawals = pos_handle.process_withdrawals(current_height);
                 
                 // Create UTXOs for processed withdrawals
                 for (address, amount) in processed_withdrawals {
@@ -295,14 +467,52 @@ impl Blockchain {
         true
     }
 
-    /// Adds a new block to the chain after validation
-    /// 
-    /// # Arguments
-    /// * `block` - The block to add
-    /// 
-    /// # Returns
-    /// * `bool` - True if the block was successfully added
-    pub fn add_block(&mut self, mut block: Block) -> bool {
+    /// Validate all transactions in a block and return total fees
+    fn validate_transactions(&self, block: &Block) -> Result<u64, BlockValidationError> {
+        let mut total_fees = 0;
+
+        for tx in &block.transactions {
+            match tx.tx_type {
+                TxType::Regular => {
+                    let (fee, valid) = self.validate_regular_transaction(tx)?;
+                    if !valid {
+                        return Err(BlockValidationError::InvalidTransaction(
+                            "Invalid regular transaction".to_string()
+                        ));
+                    }
+                    total_fees += fee;
+                },
+                TxType::Stake => {
+                    if !self.validate_stake_transaction(tx)? {
+                        return Err(BlockValidationError::InvalidTransaction(
+                            "Invalid stake transaction".to_string()
+                        ));
+                    }
+                },
+                TxType::Unstake => {
+                    if !self.validate_unstake_transaction(tx)? {
+                        return Err(BlockValidationError::InvalidTransaction(
+                            "Invalid unstake transaction".to_string()
+                        ));
+                    }
+                },
+                TxType::BlockReward => {
+                    // Block rewards are handled separately
+                    continue;
+                }
+            }
+        }
+
+        Ok(total_fees)
+    }
+
+    /// Validates a block without modifying any state
+    fn validate_block(&self, block: &Block) -> BlockValidationResult {
+        let mut result = BlockValidationResult::default();
+
+        // Compute and store block hash early
+        result.block_hash = self.hash_block(block);
+
         // Block signature verification
         let _block_data = bincode::serialize(&(
             block.index,
@@ -314,60 +524,193 @@ impl Blockchain {
 
         // Verify block connects to previous block
         let last_block = self.blocks.last().unwrap();
-        if block.prev_hash != self.hash_block(last_block) {
-            info!("Block does not connect to blockchain");
-            return false;
+        let prev_hash = self.hash_block(last_block);
+        if block.prev_hash != prev_hash {
+            result.validation = Err(BlockValidationError::InvalidConnection(
+                "Block does not connect to blockchain".to_string()
+            ));
+            return result;
         }
 
-        // Check finalization rules
-        if let Some(pos_state) = &self.pos_state {
-            let finalized_height = pos_state.get_finalized_height();
+        // Check finalization rules and slashing conditions
+        if let Some(pos_handle) = &self.pos_handle {
+            let finalized_height = pos_handle.get_finalized_height();
             
-            // Find the fork point
-            let mut fork_height = block.index;
-            let mut current_hash = block.prev_hash.clone();
-            let mut found_fork = false;
+            // Verify VRF proof
+            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &result.block_hash) {
+                result.validation = Err(BlockValidationError::InvalidProposer(
+                    "Invalid VRF proof".to_string()
+                ));
+                return result;
+            }
 
-            for existing_block in self.blocks.iter().rev() {
-                if self.hash_block(existing_block) == current_hash {
-                    fork_height = existing_block.index;
-                    found_fork = true;
-                    break;
+            // Find the fork point with improved logic
+            match self.find_fork_point(block, &mut result) {
+                Ok(fork_info) => {
+                    // Check if fork is below finalized height
+                    if fork_info.height <= finalized_height {
+                        result.validation = Err(BlockValidationError::BelowFinalizedHeight(finalized_height));
+                        return result;
+                    }
+                },
+                Err(e) => {
+                    result.validation = Err(e);
+                    return result;
                 }
             }
 
-            if !found_fork {
-                info!("Could not find fork point");
-                return false;
+            // Check if proposer's key is allowed to stake
+            if let Some(staker) = pos_handle.get_staker(&block.proposer_address) {
+                if !pos_handle.is_key_allowed_to_stake(&staker.public_key, block.index) {
+                    result.validation = Err(BlockValidationError::InvalidProposer(
+                        "Proposer's key is not allowed to stake at this height".to_string()
+                    ));
+                    return result;
+                }
             }
 
-            // Check if fork is below finalized height
-            if fork_height <= finalized_height {
-                info!("Cannot reorganize chain below finalized height {}", finalized_height);
-                return false;
+            result.checkpoint_needed = pos_handle.should_create_checkpoint(block.index);
+        }
+
+        // Validate transactions
+        match self.validate_transactions(block) {
+            Ok(fees) => {
+                result.total_fees = fees;
+            },
+            Err(e) => {
+                result.validation = Err(e);
+                return result;
             }
         }
 
         // Verify no existing block reward transaction
         if block.transactions.iter().any(|tx| matches!(tx.tx_type, TxType::BlockReward)) {
-            info!("Block already contains a reward transaction");
-            return false;
+            result.validation = Err(BlockValidationError::InvalidReward(
+                "Block already contains a reward transaction".to_string()
+            ));
+            return result;
         }
 
-        // Apply all regular transactions first
-        for tx in &block.transactions {
-            let ok = self.apply_transaction(tx);
-            if !ok {
-                return false;
+        result
+    }
+
+    /// Find the fork point of a new block
+    fn find_fork_point(&self, block: &Block, result: &mut BlockValidationResult) 
+        -> Result<ForkInfo, BlockValidationError> {
+        let mut height = block.index;
+        let mut current_hash = block.prev_hash.clone();
+        
+        // Create a temporary vec of block hashes with their heights
+        let block_hashes: Vec<_> = self.blocks.iter()
+            .map(|b| (b.index, self.hash_block(b)))
+            .collect();
+
+        for (block_height, hash) in block_hashes.iter().rev() {
+            if *hash == current_hash {
+                result.fork_point = Some(*block_height);
+                return Ok(ForkInfo {
+                    height: *block_height,
+                    hash: hash.clone(),
+                });
             }
         }
 
-        // Add block reward transaction
-        let block_reward = self.compute_block_reward(block.index);
+        Err(BlockValidationError::InvalidFork("Could not find fork point".to_string()))
+    }
+
+    /// Validate a regular transaction and return (fee, is_valid)
+    fn validate_regular_transaction(&self, tx: &Transaction) -> Result<(u64, bool), BlockValidationError> {
+        let mut total_in = 0;
+        let mut total_out = 0;
+
+        // Validate inputs
+        for inp in &tx.inputs {
+            let utxo = self.utxos.get(&inp.utxo_id).ok_or_else(|| {
+                BlockValidationError::InvalidTransaction(format!("UTXO does not exist: {}", inp.utxo_id))
+            })?;
+
+            let tx_hash = bincode::serialize(&tx).unwrap();
+            if !verify_signature(&tx_hash, &inp.sig, &inp.pub_key) {
+                return Ok((0, false));
+            }
+
+            let pk_hash = derive_address_from_pk(&inp.pub_key);
+            if pk_hash != utxo.owner_hash {
+                return Ok((0, false));
+            }
+
+            total_in += utxo.amount;
+        }
+
+        // Calculate total output
+        for outp in &tx.outputs {
+            total_out += outp.amount;
+        }
+
+        if total_in < total_out {
+            return Ok((0, false));
+        }
+
+        // Calculate fee
+        let fee = total_in - total_out;
+        Ok((fee, true))
+    }
+
+    /// Validate a stake transaction
+    fn validate_stake_transaction(&self, tx: &Transaction) -> Result<bool, BlockValidationError> {
+        if tx.lock_period.is_none() || tx.lock_period.unwrap() < 100 {
+            return Ok(false);
+        }
+        // Additional stake validation logic here
+        Ok(true)
+    }
+
+    /// Validate an unstake transaction
+    fn validate_unstake_transaction(&self, tx: &Transaction) -> Result<bool, BlockValidationError> {
+        if let Some(pos_handle) = &self.pos_handle {
+            let staker_hash = derive_address_from_pk(&tx.inputs[0].pub_key);
+            if !pos_handle.validate_unstake(&staker_hash) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Updates PoS state for a new block
+    fn update_pos_state(pos_handle: &mut PosStateHandle, block_index: u64, proposer_address: &[u8], block_hash: &[u8], checkpoint_needed: bool) {
+        // Record the proposal
+        pos_handle.record_proposal(block_index, proposer_address, block_hash);
+        
+        // Create checkpoint if needed
+        if checkpoint_needed {
+            pos_handle.create_checkpoint(block_index);
+        }
+    }
+
+    /// Adds a new block to the chain after validation
+    pub fn add_block(&mut self, block: Block) -> Result<(), BlockValidationError> {
+        // First validate the block without modifying state
+        let validation = self.validate_block(&block);
+        validation.validation?;
+
+        // Clone block for modification
+        let mut block_to_add = block.clone();
+
+        // Apply all regular transactions first
+        for tx in &block.transactions {
+            if !self.apply_transaction(tx) {
+                return Err(BlockValidationError::InvalidTransaction(
+                    "Failed to apply transaction".to_string()
+                ));
+            }
+        }
+
+        // Add block reward transaction with fees
+        let block_reward = self.compute_block_reward(block.index) + validation.total_fees;
         if block_reward > 0 {
             let reward_tx = Transaction {
                 tx_type: TxType::BlockReward,
-                inputs: vec![], // No inputs for minted coins
+                inputs: vec![],
                 outputs: vec![TxOutput {
                     amount: block_reward,
                     recipient_hash: block.proposer_address.clone(),
@@ -375,29 +718,32 @@ impl Blockchain {
                 lock_period: None,
             };
 
-            // Apply the reward transaction
             if !self.apply_transaction(&reward_tx) {
-                info!("Failed to apply block reward transaction");
-                return false;
+                return Err(BlockValidationError::InvalidReward(
+                    "Failed to apply block reward transaction".to_string()
+                ));
             }
 
-            // Add reward transaction to block
-            block.transactions.push(reward_tx);
+            block_to_add.transactions.push(reward_tx);
             info!("Added block reward of {} coins to proposer", block_reward as f64 / 1_000_000_000.0);
         }
 
-        let block_index = block.index; // Clone the index before moving block
+        // Extract all necessary information before modifying state
+        let block_index = block.index;
+        let proposer_address = block.proposer_address.clone();
+        let block_hash = validation.block_hash;
+        let checkpoint_needed = validation.checkpoint_needed;
         
         // Finally add the block
         info!("Adding block #{} with total supply: {}", block_index, self.get_total_supply() as f64 / 1_000_000_000.0);
-        self.blocks.push(block);
+        self.blocks.push(block_to_add);
 
-        // Create checkpoint if needed
-        if let Some(pos_state) = &mut self.pos_state {
-            pos_state.create_checkpoint(block_index);
+        // Handle PoS state updates
+        if let Some(pos_handle) = &mut self.pos_handle {
+            Self::update_pos_state(pos_handle, block_index, &proposer_address, &block_hash, checkpoint_needed);
         }
 
-        true
+        Ok(())
     }
 
     /// Computes the hash of a block
@@ -415,45 +761,51 @@ impl Blockchain {
         hasher.finalize().to_vec()
     }
 
-    pub fn propose_block(&self, pos_state: &mut PoSState) -> Option<Block> {
+    pub fn propose_block(&mut self) -> Option<Block> {
+        // Get PoS handle
+        let pos_handle = self.pos_handle.as_mut()?;
+
+        // Initialize VRF if needed
+        if let Err(e) = pos_handle.initialize_vrf() {
+            info!("Failed to initialize VRF: {}", e);
+            return None;
+        }
+
+        // Get block data
         let last_block = self.blocks.last()?;
         let next_index = last_block.index + 1;
-        let prev_hash = self.hash_block(last_block);
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let prev_hash = {
+            use sha2::{Sha256, Digest};
+            let encoded = bincode::serialize(last_block).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(&encoded);
+            hasher.finalize().to_vec()
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        // Initialize VRF if needed
-        if pos_state.vrf.is_none() {
-            if let Err(e) = pos_state.initialize_vrf() {
-                info!("Failed to initialize VRF: {}", e);
-                return None;
-            }
-        }
+        // Select proposer using VRF and get proof
+        let (proposer, vrf_proof) = pos_handle.prepare_block_proposal(&prev_hash)?;
 
-        // Get stakers and VRF for proposer selection
-        let stakers: Vec<&Staker> = pos_state.stakers.values().collect();
-        let vrf = pos_state.vrf.as_mut()?;
-        
-        // Use VRF to select proposer
-        let proposer = crate::blockchain::consensus::vrf::select_proposer(
-            &stakers,
-            &prev_hash,
-            vrf
-        )?;
-
-        // For MVP, we're not implementing actual transaction selection
-        // In production, this would select transactions from mempool
-        let transactions = Vec::new();
-
-        Some(Block {
+        // Create block
+        let block = Block {
             index: next_index,
-            prev_hash,
+            prev_hash: prev_hash.clone(),
             timestamp,
-            transactions,
+            transactions: Vec::new(),
             proposer_address: proposer.address_hash.clone(),
-            block_signature: Vec::new(),  // Should be signed by proposer
-        })
+            block_signature: Vec::new(),
+            vrf_proof,
+        };
+
+        // Record proposal
+        let block_hash = pos_handle.compute_block_hash(&block);
+        pos_handle.record_proposal(block.index, &block.proposer_address, &block_hash);
+
+        Some(block)
     }
 }
+

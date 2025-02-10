@@ -50,6 +50,10 @@ pub struct PoSState {
     pub minimum_stake: u64,
     pub base_reward_rate: u64,  // Rewards per 1000 blocks, in basis points (1/100 of 1%)
     pub finalization: FinalizationState,
+    // Track proposals and votes per height for slashing
+    pub proposals_per_height: HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>, // height => (staker => block_hash)
+    pub votes_per_height: HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>, // height => (staker => block_hash)
+    pub transferred_keys: HashMap<Vec<u8>, u64>, // public_key => transfer_height
 }
 
 impl Clone for PoSState {
@@ -69,6 +73,9 @@ impl Clone for PoSState {
             minimum_stake: self.minimum_stake,
             base_reward_rate: self.base_reward_rate,
             finalization: self.finalization.clone(),
+            proposals_per_height: self.proposals_per_height.clone(),
+            votes_per_height: self.votes_per_height.clone(),
+            transferred_keys: self.transferred_keys.clone(),
         }
     }
 }
@@ -90,6 +97,9 @@ impl PoSState {
                 last_vote_height: HashMap::new(),
                 last_cleanup_height: 0,
             },
+            proposals_per_height: HashMap::new(),
+            votes_per_height: HashMap::new(),
+            transferred_keys: HashMap::new(),
         })
     }
 
@@ -457,6 +467,67 @@ impl PoSState {
     /// Check if a given height is finalized
     pub fn is_height_finalized(&self, height: u64) -> bool {
         height <= self.finalization.finalized_height
+    }
+
+    /// Record a block proposal and check for double proposals
+    pub fn record_proposal(&mut self, block_height: u64, staker_addr: &[u8], block_hash: &[u8]) {
+        let proposals = self.proposals_per_height.entry(block_height).or_default();
+        
+        if let Some(previous_hash) = proposals.get(staker_addr) {
+            if previous_hash != block_hash {
+                // Double proposal detected - slash the staker
+                self.slash_staker(
+                    staker_addr,
+                    SlashingReason::DoubleProposal,
+                    block_height,
+                );
+            }
+        } else {
+            proposals.insert(staker_addr.to_vec(), block_hash.to_vec());
+        }
+
+        // Cleanup old proposals (keep last 1000 blocks)
+        if block_height > 1000 {
+            self.proposals_per_height.remove(&(block_height - 1000));
+        }
+    }
+
+    /// Record a vote and check for double voting
+    pub fn record_vote(&mut self, block_height: u64, staker_addr: &[u8], block_hash: &[u8]) {
+        let votes = self.votes_per_height.entry(block_height).or_default();
+        
+        if let Some(previous_hash) = votes.get(staker_addr) {
+            if previous_hash != block_hash {
+                // Double voting detected - slash the staker
+                self.slash_staker(
+                    staker_addr,
+                    SlashingReason::DoubleVoting,
+                    block_height,
+                );
+            }
+        } else {
+            votes.insert(staker_addr.to_vec(), block_hash.to_vec());
+        }
+
+        // Cleanup old votes (keep last 1000 blocks)
+        if block_height > 1000 {
+            self.votes_per_height.remove(&(block_height - 1000));
+        }
+    }
+
+    /// Record a key transfer to prevent long-range attacks
+    pub fn record_key_transfer(&mut self, public_key: &[u8], transfer_height: u64) {
+        self.transferred_keys.insert(public_key.to_vec(), transfer_height);
+    }
+
+    /// Check if a key is allowed to stake (not transferred or slashed)
+    pub fn is_key_allowed_to_stake(&self, public_key: &[u8], current_height: u64) -> bool {
+        if let Some(transfer_height) = self.transferred_keys.get(public_key) {
+            // Key was transferred - only allow staking if within safe range
+            current_height <= *transfer_height + 10000 // Allow staking within 10000 blocks of transfer
+        } else {
+            true
+        }
     }
 }
 
