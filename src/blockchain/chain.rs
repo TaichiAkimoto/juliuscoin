@@ -269,6 +269,29 @@ impl PosStateHandle {
         hasher.update(&encoded);
         hasher.finalize().to_vec()
     }
+
+    pub fn get_epoch_length(&self) -> u64 {
+        self.inner.finalization.epoch_length
+    }
+
+    pub fn is_safe_to_build_on(&self, height: u64, current_height: u64) -> bool {
+        self.inner.is_safe_to_build_on(height, current_height)
+    }
+
+    pub fn get_stake_amount(&self, address: &[u8]) -> u64 {
+        self.inner.get_stake_amount(address)
+    }
+
+    pub fn was_staker_at_height(&self, address: &[u8], height: u64) -> bool {
+        // Check if the address was a staker at the given height by looking at historical records
+        if let Some(staker) = self.inner.stakers.get(address) {
+            // If they have a last_proposal_height before or at the target height, they were a staker
+            if let Some(last_proposal) = staker.last_proposal_height {
+                return last_proposal <= height;
+            }
+        }
+        false
+    }
 }
 
 /// The main blockchain structure that manages the chain of blocks and UTXO set.
@@ -652,66 +675,42 @@ impl Blockchain {
         let last_block = self.blocks.last().unwrap();
         let prev_hash = self.compute_block_hash(last_block);
         if block.prev_hash != prev_hash {
-            return Err(BlockValidationError::InvalidConnection("Block does not connect to blockchain".to_string()));
-        }
-
-        // Check finalization rules and slashing conditions
-        if let Some(pos_handle) = &self.pos_handle {
-            let finalized_height = pos_handle.get_finalized_height();
-            
-            // Verify VRF proof
-            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &result.block_hash) {
-                return Err(BlockValidationError::InvalidProposer("Invalid VRF proof".to_string()));
-            }
-
-            // Check for double proposal
-            if let Some(existing_proposals) = pos_handle.inner.proposals_per_height.get(&block.index) {
-                if let Some(previous_hash) = existing_proposals.get(&block.proposer_address) {
-                    if previous_hash != &result.block_hash {
-                        // Record double proposal for slashing
-                        result.slashing_events.push((
-                            block.proposer_address.clone(),
-                            SlashingReason::DoubleProposal,
-                            block.index
-                        ));
-                        return Err(BlockValidationError::InvalidProposer("Double proposal detected".to_string()));
-                    }
-                }
-            }
-
-            // Check for double voting in transactions
-            for tx in &block.transactions {
-                if let Some(votes) = pos_handle.inner.votes_per_height.get(&block.index) {
-                    for input in &tx.inputs {
-                        let voter_hash = derive_address_from_pk(&input.pub_key);
-                        if let Some(previous_vote) = votes.get(&voter_hash) {
-                            if previous_vote != &result.block_hash {
-                                // Record double voting for slashing
-                                result.slashing_events.push((
-                                    voter_hash.clone(),
-                                    SlashingReason::DoubleVoting,
-                                    block.index
-                                ));
-                                return Err(BlockValidationError::InvalidTransaction("Double voting detected".to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Find the fork point
+            // If block doesn't connect to tip, check if it's a fork
             match self.find_fork_point(block) {
                 Ok(fork_info) => {
-                    // Check if fork is below finalized height
-                    if fork_info.height <= finalized_height {
-                        return Err(BlockValidationError::BelowFinalizedHeight(finalized_height));
+                    // Check finalization rules
+                    if let Some(pos_handle) = &self.pos_handle {
+                        let finalized_height = pos_handle.get_finalized_height();
+                        
+                        // Prevent forks below finalized height
+                        if fork_info.height <= finalized_height {
+                            return Err(BlockValidationError::BelowFinalizedHeight(finalized_height));
+                        }
+
+                        // Check if fork point is safe to build on
+                        if !pos_handle.is_safe_to_build_on(fork_info.height, block.index) {
+                            return Err(BlockValidationError::InvalidFork(
+                                "Fork point is not safe to build on".to_string()
+                            ));
+                        }
+
+                        // Check for long-range attack by verifying staker eligibility
+                        let proposer_stake = pos_handle.get_stake_amount(&block.proposer_address);
+                        if proposer_stake == 0 {
+                            // Check if proposer was a staker at fork height
+                            if !pos_handle.was_staker_at_height(&block.proposer_address, fork_info.height) {
+                                return Err(BlockValidationError::InvalidProposer(
+                                    "Proposer was not a staker at fork height".to_string()
+                                ));
+                            }
+                        }
+
+                        // Store fork info for later use
+                        result.fork_point = Some(fork_info.height);
                     }
-                    result.fork_point = Some(fork_info.height);
                 },
                 Err(e) => return Err(e),
             }
-
-            result.checkpoint_needed = pos_handle.should_create_checkpoint(block.index);
         }
 
         // Validate transactions
@@ -970,15 +969,45 @@ impl Blockchain {
         }
     }
 
-    /// Adds a new block to the blockchain if its index matches the current height.
-    pub fn add_block(&mut self, block: Block) -> anyhow::Result<()> {
-        // 1. Basic validation
-        if block.index != self.get_height() {
-            Err(anyhow::anyhow!("Block index {} does not match chain height {}", block.index, self.get_height()))
-        } else {
-            self.blocks.push(block);
-            Ok(())
+    /// Add a block to the chain with full validation and PoS state updates
+    pub fn add_block(&mut self, block: Block) -> Result<()> {
+        // First compute block hash since we'll need it multiple times
+        let block_ref = &block;
+        let block_hash = self.compute_block_hash(block_ref);
+        
+        // Validate the block
+        let validation_result = {
+            // Scope for temporary immutable borrow
+            self.validate_block(block_ref)?
+        };
+
+        // Handle fork case and PoS updates
+        if let Some(fork_height) = validation_result.fork_point {
+            if let Some(pos_handle) = &mut self.pos_handle {
+                let finalized_height = pos_handle.get_finalized_height();
+                
+                // Double check finalization (in case it changed during validation)
+                if fork_height <= finalized_height {
+                    return Err(anyhow!("Fork point is below finalized height"));
+                }
+
+                // Record the proposal for slashing detection
+                pos_handle.record_proposal(
+                    block.index,
+                    &block.proposer_address,
+                    &block_hash
+                );
+
+                // Update epoch tracking if needed
+                if block.index % pos_handle.get_epoch_length() == 0 {
+                    pos_handle.create_checkpoint(block.index);
+                }
+            }
         }
+
+        // Add block to chain
+        self.blocks.push(block);
+        Ok(())
     }
 
     /// Add a height() method as required by protocol.rs
@@ -1302,66 +1331,40 @@ impl Chain {
         let last_block = self.blocks.last().unwrap();
         let prev_hash = self.compute_block_hash(last_block);
         if block.prev_hash != prev_hash {
-            return Err(BlockValidationError::InvalidConnection("Block does not connect to blockchain".to_string()));
-        }
-
-        // Check finalization rules and slashing conditions
-        if let Some(pos_handle) = &self.pos_handle {
-            let finalized_height = pos_handle.get_finalized_height();
-            
-            // Verify VRF proof
-            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &result.block_hash) {
-                return Err(BlockValidationError::InvalidProposer("Invalid VRF proof".to_string()));
-            }
-
-            // Check for double proposal
-            if let Some(existing_proposals) = pos_handle.inner.proposals_per_height.get(&block.index) {
-                if let Some(previous_hash) = existing_proposals.get(&block.proposer_address) {
-                    if previous_hash != &result.block_hash {
-                        // Record double proposal for slashing
-                        result.slashing_events.push((
-                            block.proposer_address.clone(),
-                            SlashingReason::DoubleProposal,
-                            block.index
-                        ));
-                        return Err(BlockValidationError::InvalidProposer("Double proposal detected".to_string()));
-                    }
-                }
-            }
-
-            // Check for double voting in transactions
-            for tx in &block.transactions {
-                if let Some(votes) = pos_handle.inner.votes_per_height.get(&block.index) {
-                    for input in &tx.inputs {
-                        let voter_hash = derive_address_from_pk(&input.pub_key);
-                        if let Some(previous_vote) = votes.get(&voter_hash) {
-                            if previous_vote != &result.block_hash {
-                                // Record double voting for slashing
-                                result.slashing_events.push((
-                                    voter_hash.clone(),
-                                    SlashingReason::DoubleVoting,
-                                    block.index
-                                ));
-                                return Err(BlockValidationError::InvalidTransaction("Double voting detected".to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Find the fork point
+            // If block doesn't connect to tip, check if it's a fork
             match self.find_fork_point(block) {
                 Ok(fork_info) => {
-                    // Check if fork is below finalized height
-                    if fork_info.height <= finalized_height {
-                        return Err(BlockValidationError::BelowFinalizedHeight(finalized_height));
+                    // Check finalization rules
+                    if let Some(pos_handle) = &self.pos_handle {
+                        let finalized_height = pos_handle.get_finalized_height();
+                        
+                        // Prevent forks below finalized height
+                        if fork_info.height <= finalized_height {
+                            return Err(BlockValidationError::BelowFinalizedHeight(finalized_height));
+                        }
+
+                        // Check if fork point is safe to build on
+                        if !pos_handle.is_safe_to_build_on(fork_info.height, block.index) {
+                            return Err(BlockValidationError::InvalidFork(
+                                "Fork point is not safe to build on".to_string()
+                            ));
+                        }
+
+                        // Check for long-range attack by verifying staker eligibility
+                        let proposer_stake = pos_handle.get_stake_amount(&block.proposer_address);
+                        if proposer_stake == 0 {
+                            // Check if proposer was a staker at fork height
+                            if !pos_handle.was_staker_at_height(&block.proposer_address, fork_info.height) {
+                                return Err(BlockValidationError::InvalidProposer(
+                                    "Proposer was not a staker at fork height".to_string()
+                                ));
+                            }
+                        }
                     }
                     result.fork_point = Some(fork_info.height);
                 },
                 Err(e) => return Err(e),
             }
-
-            result.checkpoint_needed = pos_handle.should_create_checkpoint(block.index);
         }
 
         // Validate transactions
@@ -1374,58 +1377,44 @@ impl Chain {
         }
     }
 
-    /// Add a block to the chain
+    /// Add a block to the chain with full validation and PoS state updates
     pub fn add_block(&mut self, block: Block) -> Result<()> {
-        // 1. Basic validation
-        if block.index != self.blocks.len() as u64 {
-            return Err(anyhow!("Invalid block index"));
-        }
+        // First compute block hash since we'll need it multiple times
+        let block_ref = &block;
+        let block_hash = self.compute_block_hash(block_ref);
+        
+        // Validate the block
+        let validation_result = {
+            // Scope for temporary immutable borrow
+            self.validate_block(block_ref)?
+        };
 
-        // 2. Verify block connects to previous block
-        let prev_block = self.blocks.last().unwrap();
-        let prev_hash = self.compute_block_hash(prev_block);
-        if block.prev_hash != prev_hash {
-            return Err(anyhow!("Block does not connect to previous block"));
-        }
+        // Handle fork case and PoS updates
+        if let Some(fork_height) = validation_result.fork_point {
+            if let Some(pos_handle) = &mut self.pos_handle {
+                let finalized_height = pos_handle.get_finalized_height();
+                
+                // Double check finalization (in case it changed during validation)
+                if fork_height <= finalized_height {
+                    return Err(anyhow!("Fork point is below finalized height"));
+                }
 
-        // 3. Validate PoS consensus
-        if let Some(pos_handle) = &self.pos_handle {
-            // Verify block is not below finalized height
-            let finalized_height = pos_handle.get_finalized_height();
-            if block.index <= finalized_height {
-                return Err(anyhow!("Block height below finalized height"));
-            }
+                // Record the proposal for slashing detection
+                pos_handle.record_proposal(
+                    block.index,
+                    &block.proposer_address,
+                    &block_hash
+                );
 
-            // Verify proposer is allowed to propose
-            if !pos_handle.is_key_allowed_to_stake(&block.proposer_address, block.index) {
-                return Err(anyhow!("Proposer not allowed to create block"));
-            }
-
-            // Verify VRF proof
-            let prev_hash = self.compute_block_hash(prev_block);
-            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &self.compute_block_hash(&block)) {
-                return Err(anyhow!("Invalid VRF proof"));
-            }
-        }
-
-        // 4. Validate transactions
-        let total_fees = self.validate_transactions(&block)?;
-
-        // 5. Update PoS state if needed
-        let block_hash = self.compute_block_hash(&block);
-        if let Some(pos_handle) = &mut self.pos_handle {
-            // Record the proposal
-            pos_handle.record_proposal(block.index, &block.proposer_address, &block_hash);
-            
-            // Create checkpoint if needed
-            if pos_handle.should_create_checkpoint(block.index) {
-                pos_handle.create_checkpoint(block.index);
+                // Update epoch tracking if needed
+                if block.index % pos_handle.get_epoch_length() == 0 {
+                    pos_handle.create_checkpoint(block.index);
+                }
             }
         }
 
-        // 6. Add block to chain
+        // Add block to chain
         self.blocks.push(block);
-
         Ok(())
     }
 
@@ -1492,54 +1481,8 @@ impl BlockChain for Chain {
     }
 
     fn add_block(&mut self, block: Block) -> Result<()> {
-        // 1. Validate block
-        self.validate_block(&block)?;
-
-        // 2. Apply transactions
-        let mut new_utxos = std::collections::HashMap::new();
-        let mut remove_utxos = Vec::new();
-
-        for tx in &block.transactions {
-            // Remove spent UTXOs
-            for input in &tx.inputs {
-                remove_utxos.push(input.utxo_id.clone());
-            }
-
-            // Create new UTXOs
-            for (i, output) in tx.outputs.iter().enumerate() {
-                let utxo_id = format!("{}-{}-{}", block.index, tx.inputs.len(), i);
-                new_utxos.insert(utxo_id, UTXO {
-                    amount: output.amount,
-                    owner_hash: output.recipient_hash.clone(),
-                });
-            }
-        }
-
-        // 3. Update chain state
-        for utxo_id in remove_utxos {
-            self.utxos.remove(&utxo_id);
-        }
-        self.utxos.extend(new_utxos);
-
-        // 4. Update PoS state if needed
-        let block_hash = self.compute_block_hash(&block);
-        if let Some(pos_handle) = &mut self.pos_handle {
-            pos_handle.record_proposal(
-                block.index,
-                &block.proposer_address,
-                &block_hash
-            );
-
-            if pos_handle.should_create_checkpoint(block.index) {
-                pos_handle.create_checkpoint(block.index);
-            }
-        }
-
-        // 5. Update chain parameters
-        self.base_fee = block.base_fee;
-        self.blocks.push(block);
-
-        Ok(())
+        // Delegate to the main implementation
+        self.add_block(block)
     }
 }
 
