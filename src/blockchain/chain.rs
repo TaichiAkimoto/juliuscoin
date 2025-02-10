@@ -12,6 +12,7 @@
 use serde::{Serialize, Deserialize};
 use crate::cryptography::crypto::{verify_signature, derive_address_from_pk};
 use crate::blockchain::consensus::{PoSState, Staker};
+use crate::governance::Governance;
 use log::info;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vrf::openssl::{ECVRF, CipherSuite, Error as VRFError};
@@ -688,7 +689,7 @@ impl Blockchain {
     }
 
     /// Adds a new block to the chain after validation
-    pub fn add_block(&mut self, block: Block) -> Result<(), BlockValidationError> {
+    pub fn add_block(&mut self, block: Block, governance: &mut Governance) -> Result<(), BlockValidationError> {
         // First validate the block without modifying state
         let validation = self.validate_block(&block);
         validation.validation?;
@@ -705,8 +706,12 @@ impl Blockchain {
             }
         }
 
-        // Add block reward transaction with fees
-        let block_reward = self.compute_block_reward(block.index) + validation.total_fees;
+        // Calculate treasury fee
+        let treasury_fee = (validation.total_fees * governance.get_treasury_fee_rate()) / 10000;
+        let proposer_fee = validation.total_fees - treasury_fee;
+
+        // Add block reward transaction with fees (minus treasury portion)
+        let block_reward = self.compute_block_reward(block.index) + proposer_fee;
         if block_reward > 0 {
             let reward_tx = Transaction {
                 tx_type: TxType::BlockReward,
@@ -728,21 +733,25 @@ impl Blockchain {
             info!("Added block reward of {} coins to proposer", block_reward as f64 / 1_000_000_000.0);
         }
 
-        // Extract all necessary information before modifying state
-        let block_index = block.index;
-        let proposer_address = block.proposer_address.clone();
-        let block_hash = validation.block_hash;
-        let checkpoint_needed = validation.checkpoint_needed;
-        
-        // Finally add the block
-        info!("Adding block #{} with total supply: {}", block_index, self.get_total_supply() as f64 / 1_000_000_000.0);
-        self.blocks.push(block_to_add);
-
-        // Handle PoS state updates
-        if let Some(pos_handle) = &mut self.pos_handle {
-            Self::update_pos_state(pos_handle, block_index, &proposer_address, &block_hash, checkpoint_needed);
+        // Add treasury fee
+        if treasury_fee > 0 {
+            governance.collect_treasury_fees(treasury_fee);
+            info!("Added {} coins to governance treasury", treasury_fee as f64 / 1_000_000_000.0);
         }
 
+        // Update PoS state if needed
+        if let Some(pos_handle) = &mut self.pos_handle {
+            Self::update_pos_state(
+                pos_handle,
+                block.index,
+                &block.proposer_address,
+                &validation.block_hash,
+                validation.checkpoint_needed,
+            );
+        }
+
+        // Finally add the block
+        self.blocks.push(block_to_add);
         Ok(())
     }
 
