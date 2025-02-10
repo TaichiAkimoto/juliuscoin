@@ -61,6 +61,7 @@ pub enum TxType {
     Regular,
     Stake,
     Unstake,
+    BlockReward, // New variant for block rewards
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -125,6 +126,28 @@ impl Blockchain {
         }
     }
 
+    /// Computes the block reward for a given block height
+    /// The reward halves every 210,000 blocks (approximately every 4 years at 1 block/minute)
+    /// Starting with 50 coins per block
+    fn compute_block_reward(&self, block_height: u64) -> u64 {
+        const INITIAL_REWARD: u64 = 50_000_000_000; // 50 coins in smallest units
+        const HALVING_INTERVAL: u64 = 210_000; // Blocks between each halving
+        
+        let halvings = block_height / HALVING_INTERVAL;
+        if halvings >= 64 { // After 64 halvings the reward would be 0
+            return 0;
+        }
+        
+        let reward = INITIAL_REWARD >> halvings; // Right shift operator divides by 2 for each halving
+        info!("Block reward for height {} is {} coins", block_height, reward as f64 / 1_000_000_000.0);
+        reward
+    }
+
+    /// Calculates the total coin supply up to the current block
+    pub fn get_total_supply(&self) -> u64 {
+        self.utxos.values().map(|utxo| utxo.amount).sum()
+    }
+
     /// Validates and applies a transaction to the UTXO set
     /// 
     /// # Arguments
@@ -133,53 +156,72 @@ impl Blockchain {
     /// # Returns
     /// * `bool` - True if the transaction was successfully applied
     pub fn apply_transaction(&mut self, tx: &Transaction) -> bool {
+        // Special validation for block rewards
+        if matches!(tx.tx_type, TxType::BlockReward) {
+            if !tx.inputs.is_empty() {
+                info!("Block reward transaction cannot have inputs");
+                return false;
+            }
+            if tx.outputs.len() != 1 {
+                info!("Block reward transaction must have exactly one output");
+                return false;
+            }
+        }
+
         let mut total_in = 0;
         let mut total_out = 0;
 
-        // 入力を検証
-        for inp in &tx.inputs {
-            let utxo = match self.utxos.get(&inp.utxo_id) {
-                Some(u) => u,
-                None => {
-                    info!("UTXOが存在しません: {}", inp.utxo_id);
+        // Skip input validation for block rewards
+        if !matches!(tx.tx_type, TxType::BlockReward) {
+            // Existing input validation code...
+            for inp in &tx.inputs {
+                let utxo = match self.utxos.get(&inp.utxo_id) {
+                    Some(u) => u,
+                    None => {
+                        info!("UTXO does not exist: {}", inp.utxo_id);
+                        return false;
+                    }
+                };
+                let tx_hash = bincode::serialize(&tx).unwrap(); 
+                if !verify_signature(&tx_hash, &inp.sig, &inp.pub_key) {
+                    info!("Invalid signature");
                     return false;
                 }
-            };
-            // 所有権の検証(Dilithium署名)
-            let tx_hash = bincode::serialize(&tx).unwrap(); 
-            if !verify_signature(&tx_hash, &inp.sig, &inp.pub_key) {
-                info!("署名が無効です");
-                return false;
+                let pk_hash = derive_address_from_pk(&inp.pub_key);
+                if pk_hash != utxo.owner_hash {
+                    info!("Owner hash mismatch");
+                    return false;
+                }
+                total_in += utxo.amount;
             }
-            // 入力のowner_hashとpub_keyのハッシュが一致するかチェック
-            let pk_hash = derive_address_from_pk(&inp.pub_key);
-            if pk_hash != utxo.owner_hash {
-                info!("所有者ハッシュが一致しません");
-                return false;
-            }
-            total_in += utxo.amount;
         }
 
-        // 出力を計算
+        // Calculate total output
         for outp in &tx.outputs {
             total_out += outp.amount;
         }
 
-        // インプット合計 >= アウトプット合計 であること
-        if total_in < total_out {
-            info!("送金額が不正です。インプット合計 < アウトプット合計");
+        // Skip input/output validation for block rewards
+        if !matches!(tx.tx_type, TxType::BlockReward) && total_in < total_out {
+            info!("Invalid amount. Total input < total output");
             return false;
         }
 
         match tx.tx_type {
-            TxType::Regular => {
-                // Regular transaction processing - existing logic
+            TxType::Regular | TxType::BlockReward => {
+                // Remove existing UTXOs
                 for inp in &tx.inputs {
                     self.utxos.remove(&inp.utxo_id);
                 }
 
+                // Create new UTXOs
                 for (i, outp) in tx.outputs.iter().enumerate() {
-                    let new_id = format!("pending-txoutput-{}-{}", tx.inputs.len(), i);
+                    let new_id = if matches!(tx.tx_type, TxType::BlockReward) {
+                        format!("reward-{}-{}", self.blocks.len(), i)
+                    } else {
+                        format!("pending-txoutput-{}-{}", tx.inputs.len(), i)
+                    };
+                    
                     self.utxos.insert(new_id, UTXO {
                         amount: outp.amount,
                         owner_hash: outp.recipient_hash.clone(),
@@ -260,8 +302,8 @@ impl Blockchain {
     /// 
     /// # Returns
     /// * `bool` - True if the block was successfully added
-    pub fn add_block(&mut self, block: Block) -> bool {
-        // ブロック署名の検証
+    pub fn add_block(&mut self, mut block: Block) -> bool {
+        // Block signature verification
         let _block_data = bincode::serialize(&(
             block.index,
             block.prev_hash.clone(),
@@ -270,30 +312,54 @@ impl Blockchain {
             block.proposer_address.clone(),
         )).unwrap();
 
-        // proposer_address(ハッシュ)を利用して公開鍵自体は別途取得するのが本来ですが、
-        // MVPではブロックに秘密鍵署名が載っている前提で省略 & 検証スキップも可。
-        // ここではPoSの簡易モデルなので最低限のチェックのみ。
-        // ひとまず署名未検証でも良しとする。
-        // let valid_sig = verify_signature(&block_data, &block.block_signature, ???);
-
-        // 直前のブロックとつながっているか
+        // Verify block connects to previous block
         let last_block = self.blocks.last().unwrap();
         if block.prev_hash != self.hash_block(last_block) {
-            info!("ブロックチェーンに繋がらないブロックです");
+            info!("Block does not connect to blockchain");
             return false;
         }
 
-        // トランザクションを全て適用してみる
+        // Verify no existing block reward transaction
+        if block.transactions.iter().any(|tx| matches!(tx.tx_type, TxType::BlockReward)) {
+            info!("Block already contains a reward transaction");
+            return false;
+        }
+
+        // Apply all regular transactions first
         for tx in &block.transactions {
             let ok = self.apply_transaction(tx);
             if !ok {
-                info!("トランザクションが無効、ブロック追加失敗");
+                info!("Invalid transaction, block addition failed");
                 return false;
             }
         }
 
-        // 最後にブロックを追加
-        info!("ブロック #{} を追加", block.index);
+        // Add block reward transaction
+        let block_reward = self.compute_block_reward(block.index);
+        if block_reward > 0 {
+            let reward_tx = Transaction {
+                tx_type: TxType::BlockReward,
+                inputs: vec![], // No inputs for minted coins
+                outputs: vec![TxOutput {
+                    amount: block_reward,
+                    recipient_hash: block.proposer_address.clone(),
+                }],
+                lock_period: None,
+            };
+
+            // Apply the reward transaction
+            if !self.apply_transaction(&reward_tx) {
+                info!("Failed to apply block reward transaction");
+                return false;
+            }
+
+            // Add reward transaction to block
+            block.transactions.push(reward_tx);
+            info!("Added block reward of {} coins to proposer", block_reward as f64 / 1_000_000_000.0);
+        }
+
+        // Finally add the block
+        info!("Adding block #{} with total supply: {}", block.index, self.get_total_supply() as f64 / 1_000_000_000.0);
         self.blocks.push(block);
 
         true
