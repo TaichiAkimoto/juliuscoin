@@ -21,6 +21,7 @@ use anyhow::{Result, anyhow, Error};
 use std::error::Error as StdError;
 use std::fmt;
 use sha2::{Sha256, Digest};
+use crate::blockchain::consensus::slashing::SlashingReason;
 
 /// Represents an Unspent Transaction Output (UTXO) in the blockchain.
 /// 
@@ -313,6 +314,19 @@ pub struct BlockValidationResult {
     pub block_hash: Vec<u8>,
     pub total_fees: u64,
     pub checkpoint_needed: bool,
+    pub slashing_events: Vec<(Vec<u8>, SlashingReason, u64)>, // (address, reason, height)
+}
+
+impl BlockValidationResult {
+    fn new(block_hash: Vec<u8>) -> Self {
+        Self {
+            fork_point: None,
+            block_hash,
+            total_fees: 0,
+            checkpoint_needed: false,
+            slashing_events: Vec::new(),
+        }
+    }
 }
 
 impl Blockchain {
@@ -632,10 +646,7 @@ impl Blockchain {
 
     /// Validates a block without modifying any state
     pub fn validate_block(&self, block: &Block) -> Result<BlockValidationResult, BlockValidationError> {
-        let mut result = BlockValidationResult::default();
-
-        // Compute and store block hash early
-        result.block_hash = self.compute_block_hash(block);
+        let mut result = BlockValidationResult::new(self.compute_block_hash(block));
 
         // Verify block connects to previous block
         let last_block = self.blocks.last().unwrap();
@@ -653,6 +664,41 @@ impl Blockchain {
                 return Err(BlockValidationError::InvalidProposer("Invalid VRF proof".to_string()));
             }
 
+            // Check for double proposal
+            if let Some(existing_proposals) = pos_handle.inner.proposals_per_height.get(&block.index) {
+                if let Some(previous_hash) = existing_proposals.get(&block.proposer_address) {
+                    if previous_hash != &result.block_hash {
+                        // Record double proposal for slashing
+                        result.slashing_events.push((
+                            block.proposer_address.clone(),
+                            SlashingReason::DoubleProposal,
+                            block.index
+                        ));
+                        return Err(BlockValidationError::InvalidProposer("Double proposal detected".to_string()));
+                    }
+                }
+            }
+
+            // Check for double voting in transactions
+            for tx in &block.transactions {
+                if let Some(votes) = pos_handle.inner.votes_per_height.get(&block.index) {
+                    for input in &tx.inputs {
+                        let voter_hash = derive_address_from_pk(&input.pub_key);
+                        if let Some(previous_vote) = votes.get(&voter_hash) {
+                            if previous_vote != &result.block_hash {
+                                // Record double voting for slashing
+                                result.slashing_events.push((
+                                    voter_hash.clone(),
+                                    SlashingReason::DoubleVoting,
+                                    block.index
+                                ));
+                                return Err(BlockValidationError::InvalidTransaction("Double voting detected".to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+
             // Find the fork point
             match self.find_fork_point(block) {
                 Ok(fork_info) => {
@@ -665,13 +711,6 @@ impl Blockchain {
                 Err(e) => return Err(e),
             }
 
-            // Optionally, check proposer's key if available
-            if let Some(staker) = pos_handle.get_staker(&block.proposer_address) {
-                if !pos_handle.is_key_allowed_to_stake(&staker.public_key, block.index) {
-                    return Err(BlockValidationError::InvalidProposer("Proposer's key is not allowed to stake at this height".to_string()));
-                }
-            }
-
             result.checkpoint_needed = pos_handle.should_create_checkpoint(block.index);
         }
 
@@ -681,7 +720,7 @@ impl Blockchain {
                 result.total_fees = fees;
                 Ok(result)
             },
-            Err(e) => return Err(BlockValidationError::InvalidTransaction(e.to_string())),
+            Err(e) => Err(BlockValidationError::InvalidTransaction(e.to_string())),
         }
     }
 
@@ -960,6 +999,22 @@ impl Blockchain {
             self.blocks.truncate(height as usize);
             Ok(())
         }
+    }
+
+    pub fn process_block(&mut self, block: Block) -> Result<(), BlockValidationError> {
+        // First validate the block
+        let validation_result = self.validate_block(&block)?;
+
+        // Apply any slashing events
+        if let Some(pos_handle) = &mut self.pos_handle {
+            for (address, reason, height) in validation_result.slashing_events {
+                pos_handle.inner.slash_staker(&address, reason, height);
+            }
+        }
+
+        // Process the block...
+        // ... rest of block processing logic ...
+        Ok(())
     }
 }
 
@@ -1241,18 +1296,13 @@ impl Chain {
 
     /// Validate a block and return validation result
     pub fn validate_block(&self, block: &Block) -> Result<BlockValidationResult, BlockValidationError> {
-        let mut result = BlockValidationResult::default();
-
-        // Compute and store block hash early
-        result.block_hash = self.calculate_block_hash(block);
+        let mut result = BlockValidationResult::new(self.compute_block_hash(block));
 
         // Verify block connects to previous block
         let last_block = self.blocks.last().unwrap();
-        let prev_hash = self.calculate_block_hash(last_block);
+        let prev_hash = self.compute_block_hash(last_block);
         if block.prev_hash != prev_hash {
-            return Err(BlockValidationError::InvalidConnection(
-                "Block does not connect to blockchain".to_string()
-            ));
+            return Err(BlockValidationError::InvalidConnection("Block does not connect to blockchain".to_string()));
         }
 
         // Check finalization rules and slashing conditions
@@ -1261,9 +1311,42 @@ impl Chain {
             
             // Verify VRF proof
             if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &result.block_hash) {
-                return Err(BlockValidationError::InvalidProposer(
-                    "Invalid VRF proof".to_string()
-                ));
+                return Err(BlockValidationError::InvalidProposer("Invalid VRF proof".to_string()));
+            }
+
+            // Check for double proposal
+            if let Some(existing_proposals) = pos_handle.inner.proposals_per_height.get(&block.index) {
+                if let Some(previous_hash) = existing_proposals.get(&block.proposer_address) {
+                    if previous_hash != &result.block_hash {
+                        // Record double proposal for slashing
+                        result.slashing_events.push((
+                            block.proposer_address.clone(),
+                            SlashingReason::DoubleProposal,
+                            block.index
+                        ));
+                        return Err(BlockValidationError::InvalidProposer("Double proposal detected".to_string()));
+                    }
+                }
+            }
+
+            // Check for double voting in transactions
+            for tx in &block.transactions {
+                if let Some(votes) = pos_handle.inner.votes_per_height.get(&block.index) {
+                    for input in &tx.inputs {
+                        let voter_hash = derive_address_from_pk(&input.pub_key);
+                        if let Some(previous_vote) = votes.get(&voter_hash) {
+                            if previous_vote != &result.block_hash {
+                                // Record double voting for slashing
+                                result.slashing_events.push((
+                                    voter_hash.clone(),
+                                    SlashingReason::DoubleVoting,
+                                    block.index
+                                ));
+                                return Err(BlockValidationError::InvalidTransaction("Double voting detected".to_string()));
+                            }
+                        }
+                    }
+                }
             }
 
             // Find the fork point
@@ -1300,7 +1383,7 @@ impl Chain {
 
         // 2. Verify block connects to previous block
         let prev_block = self.blocks.last().unwrap();
-        let prev_hash = self.calculate_block_hash(prev_block);
+        let prev_hash = self.compute_block_hash(prev_block);
         if block.prev_hash != prev_hash {
             return Err(anyhow!("Block does not connect to previous block"));
         }
@@ -1319,8 +1402,8 @@ impl Chain {
             }
 
             // Verify VRF proof
-            let prev_hash = self.calculate_block_hash(prev_block);
-            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &self.calculate_block_hash(&block)) {
+            let prev_hash = self.compute_block_hash(prev_block);
+            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &self.compute_block_hash(&block)) {
                 return Err(anyhow!("Invalid VRF proof"));
             }
         }
@@ -1329,7 +1412,7 @@ impl Chain {
         let total_fees = self.validate_transactions(&block)?;
 
         // 5. Update PoS state if needed
-        let block_hash = self.calculate_block_hash(&block);
+        let block_hash = self.compute_block_hash(&block);
         if let Some(pos_handle) = &mut self.pos_handle {
             // Record the proposal
             pos_handle.record_proposal(block.index, &block.proposer_address, &block_hash);
@@ -1350,7 +1433,7 @@ impl Chain {
     pub fn find_fork_point(&self, block: &Block) -> Result<ForkInfo, BlockValidationError> {
         let mut current_hash = block.prev_hash.clone();
         let block_hashes: Vec<_> = self.blocks.iter()
-            .map(|b| (b.index, self.calculate_block_hash(b)))
+            .map(|b| (b.index, self.compute_block_hash(b)))
             .collect();
 
         for (block_height, hash) in block_hashes.iter().rev() {
@@ -1361,6 +1444,7 @@ impl Chain {
                 });
             }
         }
+
         Err(BlockValidationError::InvalidFork("Could not find fork point".to_string()))
     }
 }
@@ -1395,8 +1479,8 @@ impl BlockChain for Chain {
             }
 
             // Verify VRF proof
-            let prev_hash = self.calculate_block_hash(self.blocks.last().unwrap());
-            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &self.calculate_block_hash(block)) {
+            let prev_hash = self.compute_block_hash(self.blocks.last().unwrap());
+            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &self.compute_block_hash(block)) {
                 return Err(anyhow!("Invalid VRF proof"));
             }
         }
@@ -1438,7 +1522,7 @@ impl BlockChain for Chain {
         self.utxos.extend(new_utxos);
 
         // 4. Update PoS state if needed
-        let block_hash = self.calculate_block_hash(&block);
+        let block_hash = self.compute_block_hash(&block);
         if let Some(pos_handle) = &mut self.pos_handle {
             pos_handle.record_proposal(
                 block.index,

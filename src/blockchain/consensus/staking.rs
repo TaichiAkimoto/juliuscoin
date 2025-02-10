@@ -129,10 +129,96 @@ impl PoSState {
                 penalty_amount,
             );
 
-            staker.stake_amount -= penalty_amount;
+            // Apply the penalty
+            staker.stake_amount = staker.stake_amount.saturating_sub(penalty_amount);
+            
+            // Record the slashing event
             staker.slashing_records.push(record.clone());
             self.slashing_records.push(record);
+
+            // For severe violations, remove from active validator set
+            match reason {
+                SlashingReason::DoubleProposal | SlashingReason::DoubleVoting => {
+                    // Remove all stake for severe violations
+                    staker.stake_amount = 0;
+                }
+                SlashingReason::Offline => {
+                    // For offline violations, if stake drops below minimum, remove completely
+                    if staker.stake_amount < self.minimum_stake {
+                        staker.stake_amount = 0;
+                    }
+                }
+            }
+
+            // If no stake left, queue for removal
+            if staker.stake_amount == 0 {
+                // The staker will be removed in the next cleanup cycle
+                staker.last_active_time = 0;
+            }
         }
+    }
+
+    pub fn cleanup_slashed_validators(&mut self, current_height: u64) {
+        // Collect addresses to remove
+        let addresses_to_remove: Vec<_> = self.stakers
+            .iter()
+            .filter(|(_, staker)| {
+                // Remove if stake is 0 and has slashing records
+                staker.stake_amount == 0 && !staker.slashing_records.is_empty()
+            })
+            .map(|(addr, _)| addr.clone())
+            .collect();
+
+        // Process removals
+        for address in addresses_to_remove {
+            if let Some(staker) = self.stakers.remove(&address) {
+                // Create withdrawal request for any remaining rewards
+                if staker.accumulated_rewards > 0 {
+                    let withdrawal = WithdrawalRequest {
+                        amount: staker.accumulated_rewards,
+                        request_height: current_height,
+                        unlock_height: current_height + 100, // Standard unlock period
+                    };
+                    
+                    // Re-insert staker with only the withdrawal request
+                    self.stakers.insert(address.clone(), Staker {
+                        address_hash: address,
+                        stake_amount: 0,
+                        public_key: staker.public_key,
+                        secret_key: vec![],
+                        last_proposal_height: None,
+                        last_active_time: 0,
+                        slashing_records: staker.slashing_records,
+                        pending_withdrawals: vec![withdrawal],
+                        accumulated_rewards: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn process_slashing_records(&mut self, current_height: u64) {
+        // Process any pending slashing records
+        let records_to_process: Vec<_> = self.slashing_records
+            .iter()
+            .filter(|record| record.block_height + 100 <= current_height) // Wait 100 blocks before finalizing
+            .cloned()
+            .collect();
+
+        for record in records_to_process {
+            if let Some(staker) = self.stakers.get_mut(&record.staker_address) {
+                // Remove the record from pending
+                self.slashing_records.retain(|r| r.block_height != record.block_height);
+                
+                // If stake is 0 and no pending withdrawals, mark for cleanup
+                if staker.stake_amount == 0 && staker.pending_withdrawals.is_empty() {
+                    staker.last_active_time = 0;
+                }
+            }
+        }
+
+        // Run cleanup
+        self.cleanup_slashed_validators(current_height);
     }
 
     pub fn create_checkpoint(&mut self, block_height: u64) -> bool {
@@ -144,16 +230,33 @@ impl PoSState {
                 .unwrap()
                 .as_secs();
             
+            // Enhanced offline detection parameters
             let offline_threshold = 24 * 60 * 60; // 24 hours
+            let missed_blocks_threshold = 100; // Number of consecutive blocks missed before slashing
             
-            // Collect addresses that need slashing first
+            // Collect addresses that need slashing
             let addresses_to_slash: Vec<_> = self.stakers
                 .iter()
-                .filter(|(_, staker)| current_time - staker.last_active_time > offline_threshold)
+                .filter(|(_, staker)| {
+                    // Check both time-based and block-based inactivity
+                    let time_inactive = current_time - staker.last_active_time > offline_threshold;
+                    
+                    // Check if staker has missed too many consecutive blocks
+                    let missed_blocks = if let Some(last_height) = staker.last_proposal_height {
+                        block_height - last_height
+                    } else {
+                        block_height // If never proposed, count from start
+                    };
+                    
+                    let blocks_missed = missed_blocks > missed_blocks_threshold;
+                    
+                    // Only slash if both conditions are met to avoid false positives
+                    time_inactive && blocks_missed
+                })
                 .map(|(addr, _)| addr.clone())
                 .collect();
             
-            // Then perform slashing
+            // Then perform slashing with appropriate penalties
             for address in addresses_to_slash {
                 self.slash_staker(
                     &address,
@@ -161,6 +264,9 @@ impl PoSState {
                     block_height,
                 );
             }
+
+            // Process any pending slashing records
+            self.process_slashing_records(block_height);
             
             true
         } else {

@@ -100,12 +100,12 @@ unsafe impl Send for P2PNetwork {}
 unsafe impl Sync for P2PNetwork {}
 
 impl P2PNetwork {
-    pub fn new(port: u16, chain: Blockchain) -> Arc<Self> {
+    pub fn new(port: u16, chain: Arc<Mutex<Blockchain>>) -> Arc<Self> {
         Arc::new(Self {
             port,
             peers: Arc::new(Mutex::new(HashMap::new())),
             keypair: generate_kyber_keypair(),
-            chain: Arc::new(Mutex::new(chain)),
+            chain,
         })
     }
 
