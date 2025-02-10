@@ -863,11 +863,12 @@ impl P2PNetwork {
                         }
                     }
                 },
-                Err(BlockValidationError::BelowFinalizedHeight(_)) => {
-                    // Ignore blocks below finalization
-                    continue;
-                },
                 Err(e) => {
+                    // Check if this is a finalization error by looking at the error message
+                    if e.to_string().contains("below finalized height") {
+                        // Ignore blocks below finalization
+                        continue;
+                    }
                     warn!("Invalid block from peer: {:?}", e);
                     peer.update_score(PeerScoreCategory::InvalidBlock).await;
                     continue;
