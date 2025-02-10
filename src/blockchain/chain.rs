@@ -204,16 +204,23 @@ impl PosStateHandle {
     pub fn prepare_block_proposal(&mut self, prev_hash: &[u8]) -> Option<(Staker, Vec<u8>)> {
         // Get VRF proof and output
         let (proof, vrf_output) = self.generate_vrf_proof_and_output(prev_hash)?;
-        
-        // Convert VRF output to a random value between 0 and 1
+
+        // Optionally apply VDF if enabled
+        let final_output = if self.inner.use_vdf {
+            apply_vdf(&vrf_output, self.inner.vdf_iterations)
+        } else {
+            vrf_output.clone()
+        };
+
+        // Convert final output to a random value between 0 and 1
         let random_value = {
             let mut value = 0u64;
-            for (i, byte) in vrf_output.iter().take(8).enumerate() {
+            for (i, byte) in final_output.iter().take(8).enumerate() {
                 value |= (*byte as u64) << (i * 8);
             }
             value as f64 / u64::MAX as f64
         };
-        
+
         // Get stakers and calculate total stake
         let stakers: Vec<&Staker> = self.inner.stakers.values().collect();
         let total_stake: u64 = stakers.iter().map(|s| s.stake_amount).sum();
@@ -768,12 +775,20 @@ impl Blockchain {
         Ok(true)
     }
 
-    /// Updates PoS state for a new block
-    pub fn update_pos_state(pos_handle: &mut PosStateHandle, block_index: u64, proposer_address: &[u8], block_hash: &[u8], checkpoint_needed: bool) {
+    /// Updates PoS state for a new block, recording proposal and creating a checkpoint if needed
+    pub fn update_pos_state(&self, pos_handle: &mut PosStateHandle, block_index: u64, proposer_address: &[u8], block_hash: &[u8], checkpoint_needed: bool) {
         pos_handle.record_proposal(block_index, proposer_address, block_hash);
         if checkpoint_needed {
             pos_handle.create_checkpoint(block_index);
         }
+    }
+
+    /// Computes the SHA-256 hash of a block
+    pub fn compute_block_hash(&self, block: &Block) -> Vec<u8> {
+        let encoded = bincode::serialize(block).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&encoded);
+        hasher.finalize().to_vec()
     }
 
     /// Calculate and apply fees for a block
@@ -849,20 +864,6 @@ impl Blockchain {
         }
         
         (total_fees, burned_fees)
-    }
-
-    /// Computes the hash of a block
-    /// 
-    /// # Arguments
-    /// * `block` - The block to hash
-    /// 
-    /// # Returns
-    /// * `Vec<u8>` - The SHA-256 hash of the block
-    pub fn compute_block_hash(&self, block: &Block) -> Vec<u8> {
-        let encoded = bincode::serialize(block).unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(&encoded);
-        hasher.finalize().to_vec()
     }
 
     pub fn propose_block(&mut self) -> Option<Block> {
@@ -1282,13 +1283,14 @@ impl Chain {
         let total_fees = self.validate_transactions(&block)?;
 
         // 5. Update PoS state if needed
+        let block_hash = self.calculate_block_hash(&block);
         if let Some(pos_handle) = &mut self.pos_handle {
             let checkpoint_needed = pos_handle.should_create_checkpoint(block.index);
-            Self::update_pos_state(
+            self.update_pos_state(
                 pos_handle,
                 block.index,
                 &block.proposer_address,
-                &self.calculate_block_hash(&block),
+                &block_hash,
                 checkpoint_needed,
             );
         }
@@ -1297,6 +1299,24 @@ impl Chain {
         self.blocks.push(block);
 
         Ok(())
+    }
+
+    /// Find the fork point of a new block
+    pub fn find_fork_point(&self, block: &Block) -> Result<ForkInfo, BlockValidationError> {
+        let mut current_hash = block.prev_hash.clone();
+        let block_hashes: Vec<_> = self.blocks.iter()
+            .map(|b| (b.index, self.calculate_block_hash(b)))
+            .collect();
+
+        for (block_height, hash) in block_hashes.iter().rev() {
+            if *hash == current_hash {
+                return Ok(ForkInfo {
+                    height: *block_height,
+                    hash: hash.clone(),
+                });
+            }
+        }
+        Err(BlockValidationError::InvalidFork("Could not find fork point".to_string()))
     }
 }
 
@@ -1373,11 +1393,12 @@ impl BlockChain for Chain {
         self.utxos.extend(new_utxos);
 
         // 4. Update PoS state if needed
+        let block_hash = self.calculate_block_hash(&block);
         if let Some(pos_handle) = &mut self.pos_handle {
             pos_handle.record_proposal(
                 block.index,
                 &block.proposer_address,
-                &self.calculate_block_hash(&block)
+                &block_hash
             );
 
             if pos_handle.should_create_checkpoint(block.index) {
@@ -1390,6 +1411,32 @@ impl BlockChain for Chain {
         self.blocks.push(block);
 
         Ok(())
+    }
+}
+
+fn apply_vdf(input: &[u8], iterations: u64) -> Vec<u8> {
+    let mut hash = input.to_vec();
+    for _ in 0..iterations {
+        hash = Sha256::digest(&hash).to_vec();
+    }
+    hash
+}
+
+impl Chain {
+    /// Updates PoS state for a new block, recording proposal and creating a checkpoint if needed
+    pub fn update_pos_state(&self, pos_handle: &mut PosStateHandle, block_index: u64, proposer_address: &[u8], block_hash: &[u8], checkpoint_needed: bool) {
+        pos_handle.record_proposal(block_index, proposer_address, block_hash);
+        if checkpoint_needed {
+            pos_handle.create_checkpoint(block_index);
+        }
+    }
+
+    /// Computes the SHA-256 hash of a block
+    pub fn compute_block_hash(&self, block: &Block) -> Vec<u8> {
+        let encoded = bincode::serialize(block).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&encoded);
+        hasher.finalize().to_vec()
     }
 }
 

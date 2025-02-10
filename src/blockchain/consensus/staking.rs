@@ -54,6 +54,9 @@ pub struct PoSState {
     pub proposals_per_height: HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>, // height => (staker => block_hash)
     pub votes_per_height: HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>, // height => (staker => block_hash)
     pub transferred_keys: HashMap<Vec<u8>, u64>, // public_key => transfer_height
+    // New fields for VDF-based randomness
+    pub use_vdf: bool,
+    pub vdf_iterations: u64,
 }
 
 impl Clone for PoSState {
@@ -76,6 +79,8 @@ impl Clone for PoSState {
             proposals_per_height: self.proposals_per_height.clone(),
             votes_per_height: self.votes_per_height.clone(),
             transferred_keys: self.transferred_keys.clone(),
+            use_vdf: self.use_vdf,
+            vdf_iterations: self.vdf_iterations,
         }
     }
 }
@@ -100,6 +105,9 @@ impl PoSState {
             proposals_per_height: HashMap::new(),
             votes_per_height: HashMap::new(),
             transferred_keys: HashMap::new(),
+            // Default: VDF is disabled; set iterations to 1000 if enabled
+            use_vdf: false,
+            vdf_iterations: 1000,
         })
     }
 
