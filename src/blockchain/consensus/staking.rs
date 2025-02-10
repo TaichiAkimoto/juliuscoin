@@ -4,6 +4,7 @@ use serde::{Serialize, Deserialize};
 use vrf::openssl::{ECVRF, CipherSuite, Error as VRFError};
 use crate::blockchain::consensus::slashing::{SlashingReason, SlashingRecord};
 use log::info;
+use crate::blockchain::consensus::delegation::{DelegationState, StakingPool};
 
 /// Represents a withdrawal request for unstaking
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -73,6 +74,7 @@ pub struct PoSState {
     // New fields for VDF-based randomness
     pub use_vdf: bool,
     pub vdf_iterations: u64,
+    pub delegation: DelegationState,  // New field for delegation system
 }
 
 impl Clone for PoSState {
@@ -97,6 +99,7 @@ impl Clone for PoSState {
             transferred_keys: self.transferred_keys.clone(),
             use_vdf: self.use_vdf,
             vdf_iterations: self.vdf_iterations,
+            delegation: self.delegation.clone(),
         }
     }
 }
@@ -128,6 +131,7 @@ impl PoSState {
             // Default: VDF is disabled; set iterations to 1000 if enabled
             use_vdf: false,
             vdf_iterations: 1000,
+            delegation: DelegationState::new(10000), // Minimum pool stake of 10000
         })
     }
 
@@ -387,15 +391,51 @@ impl PoSState {
 
     /// Calculates and distributes staking rewards
     pub fn distribute_rewards(&mut self, current_height: u64) {
+        let mut total_stake = 0u64;
+        let mut active_validators = Vec::new();
+
+        // Calculate total stake including pool stakes
+        for staker in self.stakers.values() {
+            if staker.stake_amount >= self.minimum_stake {
+                total_stake += staker.stake_amount;
+                active_validators.push(staker.address_hash.clone());
+            }
+        }
+
+        // Collect pool data first
+        let active_pools: Vec<(Vec<u8>, u64)> = self.delegation.get_active_pools()
+            .into_iter()
+            .filter(|pool| pool.total_stake >= self.minimum_stake)
+            .map(|pool| (pool.pool_address.clone(), pool.total_stake))
+            .collect();
+
+        // Add pool stakes to total
+        for (pool_address, stake) in &active_pools {
+            total_stake += stake;
+            active_validators.push(pool_address.clone());
+        }
+
+        if total_stake == 0 || active_validators.is_empty() {
+            return;
+        }
+
+        // Calculate base reward for this distribution
+        let blocks_since_last = current_height.saturating_sub(self.last_checkpoint_height);
+        let base_reward = (blocks_since_last as u128 * self.base_reward_rate as u128 / 1000) as u64;
+
+        // Distribute rewards to individual stakers
         for staker in self.stakers.values_mut() {
-            if let Some(last_height) = staker.last_proposal_height {
-                let blocks_passed = current_height - last_height;
-                if blocks_passed >= 1000 {
-                    // Calculate rewards based on stake amount and time
-                    let reward = (staker.stake_amount * self.base_reward_rate) / 10000; // Convert basis points to percentage
-                    staker.accumulated_rewards += reward;
-                    staker.last_proposal_height = Some(current_height);
-                }
+            if staker.stake_amount >= self.minimum_stake {
+                let reward = (base_reward as u128 * staker.stake_amount as u128 / total_stake as u128) as u64;
+                staker.accumulated_rewards = staker.accumulated_rewards.saturating_add(reward);
+            }
+        }
+
+        // Calculate and distribute rewards to pools
+        for (pool_address, stake) in active_pools {
+            let reward = (base_reward as u128 * stake as u128 / total_stake as u128) as u64;
+            if let Err(e) = self.delegation.distribute_pool_rewards(&pool_address, reward) {
+                info!("Failed to distribute rewards to pool: {}", e);
             }
         }
     }
@@ -429,21 +469,38 @@ impl PoSState {
 
     /// Checks if an address is a validator
     pub fn is_validator(&self, address_hash: &[u8]) -> bool {
-        self.stakers.contains_key(address_hash)
+        // Check individual validators
+        if let Some(staker) = self.stakers.get(address_hash) {
+            return staker.stake_amount >= self.minimum_stake;
+        }
+
+        // Check staking pools
+        if let Some(pool) = self.delegation.get_pool_info(address_hash) {
+            return pool.total_stake >= self.minimum_stake;
+        }
+
+        false
     }
 
     /// Gets all active validators
-    pub fn get_active_validators(&self) -> Vec<&Staker> {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let offline_threshold = 24 * 60 * 60; // 24 hours
+    pub fn get_active_validators(&self) -> Vec<Vec<u8>> {
+        let mut validators = Vec::new();
 
-        self.stakers
-            .values()
-            .filter(|s| current_time - s.last_active_time <= offline_threshold)
-            .collect()
+        // Add individual validators
+        for staker in self.stakers.values() {
+            if staker.stake_amount >= self.minimum_stake {
+                validators.push(staker.address_hash.clone());
+            }
+        }
+
+        // Add pool validators
+        for pool in self.delegation.get_active_pools() {
+            if pool.total_stake >= self.minimum_stake {
+                validators.push(pool.pool_address.clone());
+            }
+        }
+
+        validators
     }
 
     /// Updates the last active time for a validator
@@ -723,6 +780,35 @@ impl PoSState {
             }
         }
         false
+    }
+
+    pub fn get_total_stake(&self) -> u64 {
+        let individual_stake: u64 = self.stakers.values()
+            .filter(|s| s.stake_amount >= self.minimum_stake)
+            .map(|s| s.stake_amount)
+            .sum();
+
+        let pool_stake: u64 = self.delegation.get_active_pools()
+            .iter()
+            .filter(|p| p.total_stake >= self.minimum_stake)
+            .map(|p| p.total_stake)
+            .sum();
+
+        individual_stake.saturating_add(pool_stake)
+    }
+
+    pub fn get_validator_stake(&self, address: &[u8]) -> u64 {
+        // Check individual stake
+        if let Some(staker) = self.stakers.get(address) {
+            return staker.stake_amount;
+        }
+
+        // Check if it's a pool
+        if let Some(pool) = self.delegation.get_pool_info(address) {
+            return pool.total_stake;
+        }
+
+        0
     }
 }
 
