@@ -319,6 +319,35 @@ impl Blockchain {
             return false;
         }
 
+        // Check finalization rules
+        if let Some(pos_state) = &self.pos_state {
+            let finalized_height = pos_state.get_finalized_height();
+            
+            // Find the fork point
+            let mut fork_height = block.index;
+            let mut current_hash = block.prev_hash.clone();
+            let mut found_fork = false;
+
+            for existing_block in self.blocks.iter().rev() {
+                if self.hash_block(existing_block) == current_hash {
+                    fork_height = existing_block.index;
+                    found_fork = true;
+                    break;
+                }
+            }
+
+            if !found_fork {
+                info!("Could not find fork point");
+                return false;
+            }
+
+            // Check if fork is below finalized height
+            if fork_height <= finalized_height {
+                info!("Cannot reorganize chain below finalized height {}", finalized_height);
+                return false;
+            }
+        }
+
         // Verify no existing block reward transaction
         if block.transactions.iter().any(|tx| matches!(tx.tx_type, TxType::BlockReward)) {
             info!("Block already contains a reward transaction");
@@ -329,7 +358,6 @@ impl Blockchain {
         for tx in &block.transactions {
             let ok = self.apply_transaction(tx);
             if !ok {
-                info!("Invalid transaction, block addition failed");
                 return false;
             }
         }
@@ -358,9 +386,16 @@ impl Blockchain {
             info!("Added block reward of {} coins to proposer", block_reward as f64 / 1_000_000_000.0);
         }
 
+        let block_index = block.index; // Clone the index before moving block
+        
         // Finally add the block
-        info!("Adding block #{} with total supply: {}", block.index, self.get_total_supply() as f64 / 1_000_000_000.0);
+        info!("Adding block #{} with total supply: {}", block_index, self.get_total_supply() as f64 / 1_000_000_000.0);
         self.blocks.push(block);
+
+        // Create checkpoint if needed
+        if let Some(pos_state) = &mut self.pos_state {
+            pos_state.create_checkpoint(block_index);
+        }
 
         true
     }
