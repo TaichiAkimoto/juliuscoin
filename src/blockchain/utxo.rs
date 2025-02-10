@@ -30,6 +30,7 @@ pub struct UTXO {
     pub owner_hash: Vec<u8>,
     /// Script that must be satisfied to spend this UTXO
     pub locking_script: Script,
+    pub metadata: Option<String>,
 }
 
 impl UTXO {
@@ -39,6 +40,7 @@ impl UTXO {
             amount,
             owner_hash,
             locking_script,
+            metadata: None,
         }
     }
 
@@ -76,6 +78,15 @@ impl UTXO {
         // Execute the combined script
         combined_script.execute(VecDeque::new(), block_height)
             .map_err(|e| format!("Script execution failed: {}", e))
+    }
+
+    pub fn new_with_metadata(amount: u64, owner_hash: Vec<u8>, locking_script: Script, metadata: String) -> Self {
+        Self {
+            amount,
+            owner_hash,
+            locking_script,
+            metadata: Some(metadata),
+        }
     }
 }
 

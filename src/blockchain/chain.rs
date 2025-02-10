@@ -297,6 +297,8 @@ pub struct Blockchain {
     pub gas_target: u64,
     /// Current base fee for transactions
     pub base_fee: u64,
+    /// Total amount of fees burned since chain start
+    pub total_burned_fees: u64,
 }
 
 #[derive(Debug)]
@@ -367,6 +369,7 @@ impl Blockchain {
             pos_handle: PosStateHandle::new().ok(),
             gas_target: 15_000_000,
             base_fee: 21000,
+            total_burned_fees: 0,
         }
     }
 
@@ -546,6 +549,7 @@ impl Blockchain {
                         amount: outp.amount,
                         owner_hash: outp.locking_script.code.clone(),
                         locking_script: outp.locking_script.clone(),
+                        metadata: None,
                     });
                 }
             },
@@ -593,12 +597,13 @@ impl Blockchain {
                 
                 // Create UTXOs for processed withdrawals
                 for (address, amount) in processed_withdrawals {
-                    let mut script = Script::new();
+                    let mut script = Script::create_empty();
                     script.code = address.clone();
                     let new_utxo = UTXO {
                         amount,
                         owner_hash: address.clone(),
                         locking_script: script,
+                        metadata: None,
                     };
                     let new_id = UtxoId::new(current_height, address.len() as u32, 0);
                     self.utxos.insert(new_id, new_utxo);
@@ -671,7 +676,7 @@ impl Blockchain {
                         ));
                     }
                 }
-                TxType::BlockReward => {}, // Already handled above
+                TxType::BlockReward => {} // Already handled above
             }
         }
 
@@ -683,6 +688,44 @@ impl Blockchain {
         }
 
         Ok(total_fees)
+    }
+
+    /// Handle block fees by creating burn and reward UTXOs
+    fn handle_block_fees(&mut self, block: &Block) -> Result<(), BlockValidationError> {
+        let (total_fees, burned_fees) = self.calculate_tx_fees(block);
+        let proposer_reward = total_fees.saturating_sub(burned_fees);
+        
+        // Create burn UTXO (effectively removing coins from circulation)
+        if burned_fees > 0 {
+            let burn_script = Script::create_unspendable(); // Use the correct method for creating unspendable script
+            let burn_utxo = UTXO {
+                amount: burned_fees,
+                owner_hash: [0; 32].to_vec(), // Burn address (all zeros)
+                locking_script: burn_script,
+                metadata: Some("EIP1559_BURN".to_string()),
+            };
+            let burn_utxo_id = UtxoId::new(block.index, 0, 0);
+            self.utxos.insert(burn_utxo_id, burn_utxo);
+            
+            // Update total burned amount in chain state
+            self.total_burned_fees += burned_fees;
+        }
+        
+        // Add remaining fees to proposer reward
+        if proposer_reward > 0 {
+            let mut reward_script = Script::new();
+            reward_script.code = block.proposer_address.clone();
+            let reward_utxo = UTXO {
+                amount: proposer_reward,
+                owner_hash: block.proposer_address.clone(),
+                locking_script: reward_script,
+                metadata: Some("PROPOSER_FEE".to_string()),
+            };
+            let reward_utxo_id = UtxoId::new(block.index, 0, 1);
+            self.utxos.insert(reward_utxo_id, reward_utxo);
+        }
+        
+        Ok(())
     }
 
     /// Calculate transaction fees for a block
@@ -713,13 +756,25 @@ impl Blockchain {
 
             let tx_fee = total_in.saturating_sub(total_out);
             
-            // Base fee is burned, remainder goes to proposer
-            let burn_amount = std::cmp::min(tx_fee, block.base_fee * tx.gas_used);
+            // Calculate burn amount based on base fee
+            let base_fee_burn = block.base_fee.saturating_mul(tx.gas_used);
+            let burn_amount = std::cmp::min(tx_fee, base_fee_burn);
+            
             burned_fees += burn_amount;
             total_fees += tx_fee;
         }
         
         (total_fees, burned_fees)
+    }
+
+    /// Get total amount of fees burned since chain start
+    pub fn get_total_burned_fees(&self) -> u64 {
+        self.total_burned_fees
+    }
+
+    /// Get current base fee
+    pub fn get_current_base_fee(&self) -> u64 {
+        self.blocks.last().map(|b| b.base_fee).unwrap_or(self.base_fee)
     }
 
     pub fn propose_block(&mut self) -> Option<Block> {
@@ -791,7 +846,7 @@ impl Blockchain {
     pub fn add_block(&mut self, block: Block) -> Result<()> {
         // First compute block hash since we'll need it multiple times
         let block_ref = &block;
-        let block_hash = self.compute_block_hash(block_ref);
+        let block_hash = block_ref.compute_hash();
         
         // Validate the block
         let total_fees = self.validate_transactions(block_ref)?;
@@ -845,8 +900,9 @@ impl Blockchain {
             }
 
             // Verify VRF proof
-            let prev_hash = self.compute_block_hash(self.blocks.last().unwrap());
-            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &self.compute_block_hash(&block)) {
+            let prev_block = self.blocks.last().unwrap();
+            let prev_hash = prev_block.compute_hash();
+            if !pos_handle.verify_vrf_proof(&prev_hash, &block.vrf_proof, &block.compute_hash()) {
                 return Err(BlockValidationError::InvalidProposer("Invalid VRF proof".to_string()));
             }
         }
@@ -947,37 +1003,113 @@ impl Blockchain {
         }
     }
 
-    /// Handle block fees by creating burn and reward UTXOs
-    fn handle_block_fees(&mut self, block: &Block) -> Result<(), BlockValidationError> {
-        let (total_fees, burned_fees) = self.calculate_tx_fees(block);
-        let proposer_reward = total_fees.saturating_sub(burned_fees);
-        
-        // Create burn UTXO (effectively removing coins from circulation)
-        if burned_fees > 0 {
-            let burn_script = Script::new(); // Empty script that can never be spent
-            let burn_utxo = UTXO {
-                amount: burned_fees,
-                owner_hash: vec![0; 32], // Burn address (all zeros)
-                locking_script: burn_script,
-            };
-            let burn_utxo_id = UtxoId::new(block.index, 0, 0);
-            self.utxos.insert(burn_utxo_id, burn_utxo);
+    /// Validate block structure
+    pub fn validate_block_structure(&self, block: &Block) -> Result<(), BlockValidationError> {
+        // Validate block index
+        if block.index != self.height() + 1 {
+            return Err(BlockValidationError::InvalidConnection("Invalid block index".to_string()));
         }
-        
-        // Add remaining fees to proposer reward
-        if proposer_reward > 0 {
-            let mut reward_script = Script::new();
-            reward_script.code = block.proposer_address.clone();
-            let reward_utxo = UTXO {
-                amount: proposer_reward,
-                owner_hash: block.proposer_address.clone(),
-                locking_script: reward_script,
-            };
-            let reward_utxo_id = UtxoId::new(block.index, 0, 1);
-            self.utxos.insert(reward_utxo_id, reward_utxo);
+
+        // Validate previous block hash
+        if let Some(prev_block) = self.blocks.last() {
+            let prev_hash = prev_block.compute_hash();
+            if block.prev_hash != prev_hash {
+                return Err(BlockValidationError::InvalidConnection("Invalid previous block hash".to_string()));
+            }
+        } else if !block.prev_hash.is_empty() {
+            return Err(BlockValidationError::InvalidConnection("Genesis block must have empty previous hash".to_string()));
         }
-        
+
+        // Validate gas parameters
+        if block.gas_target != self.gas_target {
+            return Err(BlockValidationError::InvalidTransaction("Invalid gas target".to_string()));
+        }
+
+        // Get the previous block for base fee calculation
+        let prev_block = self.blocks.last()
+            .ok_or_else(|| BlockValidationError::InvalidConnection("No previous block".to_string()))?;
+
+        if block.base_fee != self.calculate_next_base_fee(prev_block) {
+            return Err(BlockValidationError::InvalidTransaction("Invalid base fee".to_string()));
+        }
+
         Ok(())
+    }
+
+    /// Validate block timing
+    pub fn validate_block_timing(&self, block: &Block) -> Result<(), BlockValidationError> {
+        // Ensure block timestamp is not in the future
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        if block.timestamp > current_time + 120 { // Allow 2 minutes future drift
+            return Err(BlockValidationError::InvalidConnection("Block timestamp too far in the future".to_string()));
+        }
+
+        // Ensure block timestamp is after previous block
+        if let Some(prev_block) = self.blocks.last() {
+            if block.timestamp <= prev_block.timestamp {
+                return Err(BlockValidationError::InvalidConnection("Block timestamp must be after previous block".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Revert the blockchain to a specific height by removing blocks after that height
+    /// 
+    /// # Arguments
+    /// * `height` - The height to revert to (inclusive)
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Ok if successful, Err if height is invalid
+    pub fn revert_to_height(&mut self, height: u64) -> Result<()> {
+        if height >= self.blocks.len() as u64 {
+            return Err(anyhow!("Cannot revert to height {} as it exceeds current height {}", height, self.blocks.len() - 1));
+        }
+
+        // Remove blocks after the specified height
+        self.blocks.truncate((height + 1) as usize);
+
+        // Reset UTXOs - remove any that were created after this height
+        self.utxos.retain(|utxo_id, _| utxo_id.block_index <= height);
+
+        // If we have a PoS handle, update its state
+        if let Some(pos_handle) = &mut self.pos_handle {
+            // Create a checkpoint at the revert height to ensure consistency
+            pos_handle.create_checkpoint(height);
+        }
+
+        Ok(())
+    }
+
+    /// Calculate the total work (cumulative difficulty) of the chain
+    pub fn get_chain_work(&self) -> u64 {
+        // For now, we'll use a simple measure where each block contributes its gas_used
+        // plus a constant base difficulty. In a more sophisticated implementation,
+        // this could incorporate actual proof-of-work difficulty or stake-weighted difficulty.
+        const BASE_DIFFICULTY: u64 = 1_000_000;  // Base difficulty per block
+        
+        self.blocks.iter().map(|block| {
+            BASE_DIFFICULTY + block.gas_used
+        }).sum()
+    }
+
+    /// Computes the block reward for a given block height
+    /// The reward halves every 210,000 blocks (approximately every 4 years at 1 block/minute)
+    /// Starting with 50 coins per block
+    fn compute_block_reward(&self, block_height: u64) -> u64 {
+        const INITIAL_REWARD: u64 = 50_000_000_000; // 50 coins in smallest units
+        const HALVING_INTERVAL: u64 = 210_000; // Blocks between each halving
+        
+        let halvings = block_height / HALVING_INTERVAL;
+        if halvings >= 64 { // After 64 halvings the reward would be 0
+            return 0;
+        }
+        
+        INITIAL_REWARD >> halvings // Right shift operator divides by 2 for each halving
     }
 
     /// Validate a regular transaction and return (fee, is_valid)
@@ -1088,125 +1220,6 @@ impl Blockchain {
             }
         }
         Ok(true)
-    }
-
-    /// Compute the hash of a block
-    pub fn compute_block_hash(&self, block: &Block) -> Vec<u8> {
-        let encoded = bincode::serialize(block).unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(&encoded);
-        hasher.finalize().to_vec()
-    }
-
-    /// Computes the block reward for a given block height
-    /// The reward halves every 210,000 blocks (approximately every 4 years at 1 block/minute)
-    /// Starting with 50 coins per block
-    fn compute_block_reward(&self, block_height: u64) -> u64 {
-        const INITIAL_REWARD: u64 = 50_000_000_000; // 50 coins in smallest units
-        const HALVING_INTERVAL: u64 = 210_000; // Blocks between each halving
-        
-        let halvings = block_height / HALVING_INTERVAL;
-        if halvings >= 64 { // After 64 halvings the reward would be 0
-            return 0;
-        }
-        
-        let reward = INITIAL_REWARD >> halvings; // Right shift operator divides by 2 for each halving
-        info!("Block reward for height {} is {} coins", block_height, reward as f64 / 1_000_000_000.0);
-        reward
-    }
-
-    /// Validate block structure
-    pub fn validate_block_structure(&self, block: &Block) -> Result<(), BlockValidationError> {
-        // Validate block index
-        if block.index != self.height() + 1 {
-            return Err(BlockValidationError::InvalidConnection("Invalid block index".to_string()));
-        }
-
-        // Validate previous block hash
-        if let Some(prev_block) = self.blocks.last() {
-            let prev_hash = self.compute_block_hash(prev_block);
-            if block.prev_hash != prev_hash {
-                return Err(BlockValidationError::InvalidConnection("Invalid previous block hash".to_string()));
-            }
-        } else if !block.prev_hash.is_empty() {
-            return Err(BlockValidationError::InvalidConnection("Genesis block must have empty previous hash".to_string()));
-        }
-
-        // Validate gas parameters
-        if block.gas_target != self.gas_target {
-            return Err(BlockValidationError::InvalidTransaction("Invalid gas target".to_string()));
-        }
-
-        // Get the previous block for base fee calculation
-        let prev_block = self.blocks.last()
-            .ok_or_else(|| BlockValidationError::InvalidConnection("No previous block".to_string()))?;
-
-        if block.base_fee != self.calculate_next_base_fee(prev_block) {
-            return Err(BlockValidationError::InvalidTransaction("Invalid base fee".to_string()));
-        }
-
-        Ok(())
-    }
-
-    /// Validate block timing
-    pub fn validate_block_timing(&self, block: &Block) -> Result<(), BlockValidationError> {
-        // Ensure block timestamp is not in the future
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        if block.timestamp > current_time + 120 { // Allow 2 minutes future drift
-            return Err(BlockValidationError::InvalidConnection("Block timestamp too far in the future".to_string()));
-        }
-
-        // Ensure block timestamp is after previous block
-        if let Some(prev_block) = self.blocks.last() {
-            if block.timestamp <= prev_block.timestamp {
-                return Err(BlockValidationError::InvalidConnection("Block timestamp must be after previous block".to_string()));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Revert the blockchain to a specific height by removing blocks after that height
-    /// 
-    /// # Arguments
-    /// * `height` - The height to revert to (inclusive)
-    /// 
-    /// # Returns
-    /// * `Result<()>` - Ok if successful, Err if height is invalid
-    pub fn revert_to_height(&mut self, height: u64) -> Result<()> {
-        if height >= self.blocks.len() as u64 {
-            return Err(anyhow!("Cannot revert to height {} as it exceeds current height {}", height, self.blocks.len() - 1));
-        }
-
-        // Remove blocks after the specified height
-        self.blocks.truncate((height + 1) as usize);
-
-        // Reset UTXOs - remove any that were created after this height
-        self.utxos.retain(|utxo_id, _| utxo_id.block_index <= height);
-
-        // If we have a PoS handle, update its state
-        if let Some(pos_handle) = &mut self.pos_handle {
-            // Create a checkpoint at the revert height to ensure consistency
-            pos_handle.create_checkpoint(height);
-        }
-
-        Ok(())
-    }
-
-    /// Calculate the total work (cumulative difficulty) of the chain
-    pub fn get_chain_work(&self) -> u64 {
-        // For now, we'll use a simple measure where each block contributes its gas_used
-        // plus a constant base difficulty. In a more sophisticated implementation,
-        // this could incorporate actual proof-of-work difficulty or stake-weighted difficulty.
-        const BASE_DIFFICULTY: u64 = 1_000_000;  // Base difficulty per block
-        
-        self.blocks.iter().map(|block| {
-            BASE_DIFFICULTY + block.gas_used
-        }).sum()
     }
 }
 
@@ -1297,7 +1310,7 @@ impl Chain {
 
         // Validate previous block hash
         if let Some(prev_block) = self.blocks.last() {
-            let prev_hash = self.compute_block_hash(prev_block);
+            let prev_hash = prev_block.compute_hash();
             if block.prev_hash != prev_hash {
                 return Err(BlockValidationError::InvalidConnection("Invalid previous block hash".to_string()));
             }
@@ -1348,7 +1361,7 @@ impl Chain {
         self.blocks.len() as u64
     }
 
-    /// Compute the hash of a block
+    /// Computes the hash of a block
     pub fn compute_block_hash(&self, block: &Block) -> Vec<u8> {
         let encoded = bincode::serialize(block).unwrap();
         let mut hasher = Sha256::new();
@@ -1356,93 +1369,19 @@ impl Chain {
         hasher.finalize().to_vec()
     }
 
-    /// Compute block reward for given height
-    pub fn compute_block_reward(&self, height: u64) -> u64 {
-        const INITIAL_REWARD: u64 = 50_000_000_000; // 50 coins
-        const HALVING_INTERVAL: u64 = 210_000;
+    /// Computes the block reward for a given block height
+    /// The reward halves every 210,000 blocks (approximately every 4 years at 1 block/minute)
+    /// Starting with 50 coins per block
+    fn compute_block_reward(&self, block_height: u64) -> u64 {
+        const INITIAL_REWARD: u64 = 50_000_000_000; // 50 coins in smallest units
+        const HALVING_INTERVAL: u64 = 210_000; // Blocks between each halving
         
-        let halvings = height / HALVING_INTERVAL;
-        if halvings >= 64 {
+        let halvings = block_height / HALVING_INTERVAL;
+        if halvings >= 64 { // After 64 halvings the reward would be 0
             return 0;
         }
         
-        INITIAL_REWARD >> halvings
-    }
-
-    /// Validate all transactions in a block and return total fees
-    pub fn validate_transactions(&self, block: &Block) -> Result<u64, BlockValidationError> {
-        let mut total_fees = 0;
-        let mut total_gas_used = 0;
-
-        for tx in &block.transactions {
-            // Validate gas usage
-            if tx.gas_used > tx.gas_limit {
-                return Err(BlockValidationError::InvalidTransaction(
-                    "Transaction exceeds gas limit".to_string()
-                ));
-            }
-            total_gas_used += tx.gas_used;
-
-            // Special handling for block reward
-            if matches!(tx.tx_type, TxType::BlockReward) {
-                if !tx.inputs.is_empty() {
-                    return Err(BlockValidationError::InvalidTransaction(
-                        "Block reward cannot have inputs".to_string()
-                    ));
-                }
-                if tx.outputs.len() != 1 {
-                    return Err(BlockValidationError::InvalidTransaction(
-                        "Block reward must have exactly one output".to_string()
-                    ));
-                }
-                
-                // Validate reward amount
-                let expected_reward = self.compute_block_reward(block.index);
-                if tx.outputs[0].amount != expected_reward {
-                    return Err(BlockValidationError::InvalidTransaction(
-                        "Invalid block reward amount".to_string()
-                    ));
-                }
-                continue;
-            }
-
-            // Validate transaction based on type
-            match tx.tx_type {
-                TxType::Regular => {
-                    let (fee, valid) = self.validate_regular_transaction(tx, block)?;
-                    if !valid {
-                        return Err(BlockValidationError::InvalidTransaction(
-                            "Invalid regular transaction".to_string()
-                        ));
-                    }
-                    total_fees += fee;
-                }
-                TxType::Stake => {
-                    if !self.validate_stake_transaction(tx)? {
-                        return Err(BlockValidationError::InvalidTransaction(
-                            "Invalid stake transaction".to_string()
-                        ));
-                    }
-                }
-                TxType::Unstake => {
-                    if !self.validate_unstake_transaction(tx)? {
-                        return Err(BlockValidationError::InvalidTransaction(
-                            "Invalid unstake transaction".to_string()
-                        ));
-                    }
-                }
-                TxType::BlockReward => {} // Already handled above
-            }
-        }
-
-        // Verify total gas used matches block
-        if total_gas_used != block.gas_used {
-            return Err(BlockValidationError::InvalidTransaction(
-                "Block gas used mismatch".to_string()
-            ));
-        }
-
-        Ok(total_fees)
+        INITIAL_REWARD >> halvings // Right shift operator divides by 2 for each halving
     }
 
     /// Validate a regular transaction and return (fee, is_valid)
@@ -1554,6 +1493,82 @@ impl Chain {
         }
         Ok(true)
     }
+
+    /// Validate all transactions in a block and return total fees
+    pub fn validate_transactions(&self, block: &Block) -> Result<u64, BlockValidationError> {
+        let mut total_fees = 0;
+        let mut total_gas_used = 0;
+
+        for tx in &block.transactions {
+            // Validate gas usage
+            if tx.gas_used > tx.gas_limit {
+                return Err(BlockValidationError::InvalidTransaction(
+                    "Transaction exceeds gas limit".to_string()
+                ));
+            }
+            total_gas_used += tx.gas_used;
+
+            // Special handling for block reward
+            if matches!(tx.tx_type, TxType::BlockReward) {
+                if !tx.inputs.is_empty() {
+                    return Err(BlockValidationError::InvalidTransaction(
+                        "Block reward cannot have inputs".to_string()
+                    ));
+                }
+                if tx.outputs.len() != 1 {
+                    return Err(BlockValidationError::InvalidTransaction(
+                        "Block reward must have exactly one output".to_string()
+                    ));
+                }
+                
+                // Validate reward amount
+                let expected_reward = self.compute_block_reward(block.index);
+                if tx.outputs[0].amount != expected_reward {
+                    return Err(BlockValidationError::InvalidTransaction(
+                        "Invalid block reward amount".to_string()
+                    ));
+                }
+                continue;
+            }
+
+            // Validate transaction based on type
+            match tx.tx_type {
+                TxType::Regular => {
+                    let (fee, valid) = self.validate_regular_transaction(tx, block)?;
+                    if !valid {
+                        return Err(BlockValidationError::InvalidTransaction(
+                            "Invalid regular transaction".to_string()
+                        ));
+                    }
+                    total_fees += fee;
+                }
+                TxType::Stake => {
+                    if !self.validate_stake_transaction(tx)? {
+                        return Err(BlockValidationError::InvalidTransaction(
+                            "Invalid stake transaction".to_string()
+                        ));
+                    }
+                }
+                TxType::Unstake => {
+                    if !self.validate_unstake_transaction(tx)? {
+                        return Err(BlockValidationError::InvalidTransaction(
+                            "Invalid unstake transaction".to_string()
+                        ));
+                    }
+                }
+                TxType::BlockReward => {} // Already handled above
+            }
+        }
+
+        // Verify total gas used matches block
+        if total_gas_used != block.gas_used {
+            return Err(BlockValidationError::InvalidTransaction(
+                "Block gas used mismatch".to_string()
+            ));
+        }
+
+        Ok(total_fees)
+    }
 }
 
 impl BlockChain for Chain {
@@ -1566,8 +1581,8 @@ impl BlockChain for Chain {
     }
 
     fn validate_block(&self, block: &Block) -> Result<BlockValidationResult> {
-        // Compute block hash
-        let block_hash = self.compute_block_hash(block);
+        // Compute block hash using Block's compute_hash method
+        let block_hash = block.compute_hash();
         let mut result = BlockValidationResult::new(block_hash);
         
         // Validate block structure
@@ -1759,8 +1774,8 @@ impl BlockChain for Blockchain {
     }
 
     fn validate_block(&self, block: &Block) -> Result<BlockValidationResult> {
-        // Compute block hash
-        let block_hash = self.compute_block_hash(block);
+        // Compute block hash using Block's compute_hash method
+        let block_hash = block.compute_hash();
         let mut result = BlockValidationResult::new(block_hash);
         
         // Validate block structure

@@ -69,8 +69,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut chain_guard = chain.lock().await;
             chain_guard.propose_block()
         } {
-            let chain_guard = chain.lock().await;
-            let block_hash = chain_guard.compute_block_hash(&block);
+            let block_hash = block.compute_hash();
             info!("New block proposed with hash: {}", hex::encode(&block_hash));
         }
     }
