@@ -17,6 +17,7 @@ use log::info;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vrf::openssl::{ECVRF, CipherSuite, Error as VRFError};
 use vrf::VRF;
+use anyhow::{Result, anyhow};
 
 /// Represents an Unspent Transaction Output (UTXO) in the blockchain.
 /// 
@@ -943,6 +944,349 @@ impl Blockchain {
         pos_handle.record_proposal(block.index, &block.proposer_address, &block_hash);
 
         Some(block)
+    }
+}
+
+pub trait BlockChain {
+    /// Get the current chain height
+    fn height(&self) -> u64;
+
+    /// Get a block by its height
+    fn get_block_by_height(&self, height: u64) -> Option<Block>;
+
+    /// Validate a block before adding it to the chain
+    fn validate_block(&self, block: &Block) -> Result<()>;
+
+    /// Add a validated block to the chain
+    fn add_block(&mut self, block: Block) -> Result<()>;
+}
+
+/// Implementation of the blockchain
+pub struct Chain {
+    /// Ordered list of blocks in the chain
+    blocks: Vec<Block>,
+    /// Map of UTXO IDs to their corresponding UTXO data
+    utxos: std::collections::HashMap<String, UTXO>,
+    /// Handle to the Proof of Stake state
+    pos_state: Option<PosStateHandle>,
+    /// Current base fee for transactions
+    base_fee: u64,
+    /// Target gas usage per block
+    gas_target: u64,
+}
+
+impl Chain {
+    pub fn new() -> Self {
+        let genesis_block = Block {
+            index: 0,
+            prev_hash: vec![],
+            timestamp: 0,
+            transactions: vec![],
+            proposer_address: vec![],
+            block_signature: vec![],
+            vrf_proof: vec![],
+            base_fee: 21000, // Initial base fee
+            gas_target: 15_000_000, // Target gas per block
+            gas_used: 0,
+        };
+
+        Self {
+            blocks: vec![genesis_block],
+            utxos: std::collections::HashMap::new(),
+            pos_state: PosStateHandle::new().ok(),
+            base_fee: 21000,
+            gas_target: 15_000_000,
+        }
+    }
+
+    /// Calculate the hash of a block
+    fn calculate_block_hash(&self, block: &Block) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let encoded = bincode::serialize(&(
+            block.index,
+            &block.prev_hash,
+            block.timestamp,
+            &block.transactions,
+            &block.proposer_address,
+            &block.vrf_proof,
+            block.base_fee,
+            block.gas_target,
+            block.gas_used,
+        )).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&encoded);
+        hasher.finalize().to_vec()
+    }
+
+    /// Validate block timing
+    fn validate_block_timing(&self, block: &Block) -> Result<()> {
+        // Ensure block timestamp is not in the future
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        if block.timestamp > current_time + 120 { // Allow 2 minutes future drift
+            return Err(anyhow!("Block timestamp too far in the future"));
+        }
+
+        // Ensure block timestamp is after previous block
+        if let Some(prev_block) = self.blocks.last() {
+            if block.timestamp <= prev_block.timestamp {
+                return Err(anyhow!("Block timestamp must be after previous block"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate block structure
+    fn validate_block_structure(&self, block: &Block) -> Result<()> {
+        // Validate block index
+        if block.index != self.height() + 1 {
+            return Err(anyhow!("Invalid block index"));
+        }
+
+        // Validate previous block hash
+        if let Some(prev_block) = self.blocks.last() {
+            let prev_hash = self.calculate_block_hash(prev_block);
+            if block.prev_hash != prev_hash {
+                return Err(anyhow!("Invalid previous block hash"));
+            }
+        } else if !block.prev_hash.is_empty() {
+            return Err(anyhow!("Genesis block must have empty previous hash"));
+        }
+
+        // Validate gas parameters
+        if block.gas_target != self.gas_target {
+            return Err(anyhow!("Invalid gas target"));
+        }
+
+        if block.base_fee != self.calculate_next_base_fee() {
+            return Err(anyhow!("Invalid base fee"));
+        }
+
+        Ok(())
+    }
+
+    /// Calculate the next base fee based on current block's gas usage
+    fn calculate_next_base_fee(&self) -> u64 {
+        if let Some(current_block) = self.blocks.last() {
+            let gas_used_delta = if current_block.gas_used > self.gas_target {
+                current_block.gas_used - self.gas_target
+            } else {
+                self.gas_target - current_block.gas_used
+            };
+
+            let base_fee_delta = std::cmp::max(
+                1,
+                self.base_fee * gas_used_delta / self.gas_target / 8
+            );
+
+            if current_block.gas_used > self.gas_target {
+                self.base_fee + base_fee_delta
+            } else {
+                self.base_fee.saturating_sub(base_fee_delta)
+            }
+        } else {
+            self.base_fee
+        }
+    }
+
+    /// Validate a single transaction
+    fn validate_transaction(&self, tx: &Transaction, block: &Block) -> Result<u64> {
+        let mut total_in = 0;
+        let mut total_out = 0;
+
+        // Skip input validation for block rewards
+        if !matches!(tx.tx_type, TxType::BlockReward) {
+            // Validate inputs
+            for input in &tx.inputs {
+                let utxo = self.utxos.get(&input.utxo_id)
+                    .ok_or_else(|| anyhow!("UTXO not found: {}", input.utxo_id))?;
+
+                // Verify signature
+                let tx_hash = bincode::serialize(&tx)?;
+                if !verify_signature(&tx_hash, &input.sig, &input.pub_key) {
+                    return Err(anyhow!("Invalid transaction signature"));
+                }
+
+                // Verify ownership
+                let pk_hash = derive_address_from_pk(&input.pub_key);
+                if pk_hash != utxo.owner_hash {
+                    return Err(anyhow!("Invalid UTXO ownership"));
+                }
+
+                total_in += utxo.amount;
+            }
+        }
+
+        // Calculate total output
+        for output in &tx.outputs {
+            total_out += output.amount;
+        }
+
+        // Validate amounts
+        if !matches!(tx.tx_type, TxType::BlockReward) && total_in < total_out {
+            return Err(anyhow!("Invalid amount: inputs < outputs"));
+        }
+
+        // Calculate and validate fees
+        let fee = total_in.saturating_sub(total_out);
+        let min_fee = block.base_fee * tx.gas_used;
+        
+        if fee < min_fee {
+            return Err(anyhow!("Insufficient fee"));
+        }
+
+        Ok(fee)
+    }
+
+    /// Validate all transactions in a block
+    fn validate_transactions(&self, block: &Block) -> Result<u64> {
+        let mut total_fees = 0;
+        let mut total_gas_used = 0;
+        let mut has_reward = false;
+
+        for tx in &block.transactions {
+            // Validate gas usage
+            if tx.gas_used > tx.gas_limit {
+                return Err(anyhow!("Transaction exceeds gas limit"));
+            }
+            total_gas_used += tx.gas_used;
+
+            // Special handling for block reward
+            if matches!(tx.tx_type, TxType::BlockReward) {
+                if has_reward {
+                    return Err(anyhow!("Multiple block rewards in block"));
+                }
+                has_reward = true;
+                
+                // Validate reward amount
+                let expected_reward = self.compute_block_reward(block.index);
+                if tx.outputs.len() != 1 || tx.outputs[0].amount != expected_reward {
+                    return Err(anyhow!("Invalid block reward amount"));
+                }
+                continue;
+            }
+
+            // Validate regular transaction
+            let fee = self.validate_transaction(tx, block)?;
+            total_fees += fee;
+        }
+
+        // Verify total gas used matches block
+        if total_gas_used != block.gas_used {
+            return Err(anyhow!("Block gas used mismatch"));
+        }
+
+        Ok(total_fees)
+    }
+
+    /// Compute block reward for given height
+    fn compute_block_reward(&self, height: u64) -> u64 {
+        const INITIAL_REWARD: u64 = 50_000_000_000; // 50 coins
+        const HALVING_INTERVAL: u64 = 210_000;
+        
+        let halvings = height / HALVING_INTERVAL;
+        if halvings >= 64 {
+            return 0;
+        }
+        
+        INITIAL_REWARD >> halvings
+    }
+}
+
+impl BlockChain for Chain {
+    fn height(&self) -> u64 {
+        self.blocks.len() as u64 - 1 // Subtract 1 for genesis block
+    }
+
+    fn get_block_by_height(&self, height: u64) -> Option<Block> {
+        self.blocks.get(height as usize).cloned()
+    }
+
+    fn validate_block(&self, block: &Block) -> Result<()> {
+        // 1. Validate block structure
+        self.validate_block_structure(block)?;
+
+        // 2. Validate block timing
+        self.validate_block_timing(block)?;
+
+        // 3. Validate PoS consensus
+        if let Some(pos_state) = &self.pos_state {
+            // Verify block is not below finalized height
+            let finalized_height = pos_state.get_finalized_height();
+            if block.index <= finalized_height {
+                return Err(anyhow!("Block height below finalized height"));
+            }
+
+            // Verify proposer is allowed to propose
+            if !pos_state.is_key_allowed_to_stake(&block.proposer_address, block.index) {
+                return Err(anyhow!("Proposer not allowed to create block"));
+            }
+
+            // Verify VRF proof
+            let prev_hash = self.calculate_block_hash(self.blocks.last().unwrap());
+            if !pos_state.verify_vrf_proof(&prev_hash, &block.vrf_proof, &self.calculate_block_hash(block)) {
+                return Err(anyhow!("Invalid VRF proof"));
+            }
+        }
+
+        // 4. Validate transactions and fees
+        self.validate_transactions(block)?;
+
+        Ok(())
+    }
+
+    fn add_block(&mut self, block: Block) -> Result<()> {
+        // 1. Validate block
+        self.validate_block(&block)?;
+
+        // 2. Apply transactions
+        let mut new_utxos = std::collections::HashMap::new();
+        let mut remove_utxos = Vec::new();
+
+        for tx in &block.transactions {
+            // Remove spent UTXOs
+            for input in &tx.inputs {
+                remove_utxos.push(input.utxo_id.clone());
+            }
+
+            // Create new UTXOs
+            for (i, output) in tx.outputs.iter().enumerate() {
+                let utxo_id = format!("{}-{}-{}", block.index, tx.inputs.len(), i);
+                new_utxos.insert(utxo_id, UTXO {
+                    amount: output.amount,
+                    owner_hash: output.recipient_hash.clone(),
+                });
+            }
+        }
+
+        // 3. Update chain state
+        for utxo_id in remove_utxos {
+            self.utxos.remove(&utxo_id);
+        }
+        self.utxos.extend(new_utxos);
+
+        // 4. Update PoS state if needed
+        if let Some(pos_state) = &mut self.pos_state {
+            pos_state.record_proposal(
+                block.index,
+                &block.proposer_address,
+                &self.calculate_block_hash(&block)
+            );
+
+            if pos_state.should_create_checkpoint(block.index) {
+                pos_state.create_checkpoint(block.index);
+            }
+        }
+
+        // 5. Update chain parameters
+        self.base_fee = block.base_fee;
+        self.blocks.push(block);
+
+        Ok(())
     }
 }
 

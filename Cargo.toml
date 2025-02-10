@@ -44,6 +44,8 @@ clap = { version = "4.4", features = ["derive"] }
 # sphincsplus = "0.1"  # SPHINCS+用（必要に応じてコメントを外す）
 # falcon = "0.1"      # Falcon用（必要に応じてコメントを外す）
 
+generic-array = "0.14"
+
 [dev-dependencies]
 tokio-test = "0.4"
 pretty_assertions = "1.4"
