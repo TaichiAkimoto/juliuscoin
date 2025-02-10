@@ -13,6 +13,7 @@ use serde::{Serialize, Deserialize};
 use crate::cryptography::crypto::{verify_signature, derive_address_from_pk};
 use crate::blockchain::consensus::{PoSState, Staker};
 use log::info;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Represents an Unspent Transaction Output (UTXO) in the blockchain.
 /// 
@@ -56,11 +57,22 @@ pub struct TxOutput {
 /// A transaction consumes existing UTXOs as inputs and creates new UTXOs as outputs.
 /// The total value of inputs must equal the total value of outputs.
 #[derive(Clone, Serialize, Deserialize, Debug)]
+pub enum TxType {
+    Regular,
+    Stake,
+    Unstake,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Transaction {
+    /// Type of transaction (regular, stake, or unstake)
+    pub tx_type: TxType,
     /// List of UTXOs to be consumed
     pub inputs: Vec<TxInput>,
     /// List of new UTXOs to be created
     pub outputs: Vec<TxOutput>,
+    /// Minimum lock period for staking (in blocks), only used for Stake transactions
+    pub lock_period: Option<u64>,
 }
 
 /// Represents a block in the blockchain.
@@ -91,6 +103,8 @@ pub struct Blockchain {
     pub blocks: Vec<Block>,
     /// Map of UTXO IDs to their corresponding UTXO data
     pub utxos: std::collections::HashMap<String, UTXO>,
+    /// Proof of Stake state
+    pub pos_state: Option<PoSState>,
 }
 
 impl Blockchain {
@@ -107,6 +121,7 @@ impl Blockchain {
         Self {
             blocks: vec![genesis_block],
             utxos: std::collections::HashMap::new(),
+            pos_state: PoSState::new().ok(),
         }
     }
 
@@ -156,19 +171,83 @@ impl Blockchain {
             return false;
         }
 
-        // UTXO更新(インプットのUTXOを削除 → アウトプットを新規作成)
-        for inp in &tx.inputs {
-            self.utxos.remove(&inp.utxo_id);
-        }
+        match tx.tx_type {
+            TxType::Regular => {
+                // Regular transaction processing - existing logic
+                for inp in &tx.inputs {
+                    self.utxos.remove(&inp.utxo_id);
+                }
 
-        // 新しいUTXOを生成(簡易的に"{block_index}-tx_index-out_index"などのIDを付ける)
-        // 実際のブロック取り込み時に正式にIDをふる想定。
-        for (i, outp) in tx.outputs.iter().enumerate() {
-            let new_id = format!("pending-txoutput-{}-{}", tx.inputs.len(), i);
-            self.utxos.insert(new_id, UTXO {
-                amount: outp.amount,
-                owner_hash: outp.recipient_hash.clone(),
-            });
+                for (i, outp) in tx.outputs.iter().enumerate() {
+                    let new_id = format!("pending-txoutput-{}-{}", tx.inputs.len(), i);
+                    self.utxos.insert(new_id, UTXO {
+                        amount: outp.amount,
+                        owner_hash: outp.recipient_hash.clone(),
+                    });
+                }
+            },
+            TxType::Stake => {
+                // Validate staking requirements
+                if tx.lock_period.is_none() || tx.lock_period.unwrap() < 100 { // Minimum 100 blocks lock period
+                    info!("Invalid staking lock period");
+                    return false;
+                }
+
+                // Remove input UTXOs
+                for inp in &tx.inputs {
+                    self.utxos.remove(&inp.utxo_id);
+                }
+
+                // Create staking entry
+                let staker_hash = derive_address_from_pk(&tx.inputs[0].pub_key);
+                
+                // Update PoS state
+                if let Some(pos_state) = &mut self.pos_state {
+                    if let Err(e) = pos_state.stake(
+                        staker_hash.clone(),
+                        total_in,
+                        tx.inputs[0].pub_key.clone(),
+                    ) {
+                        info!("Staking failed: {}", e);
+                        return false;
+                    }
+                } else {
+                    info!("PoS state not initialized");
+                    return false;
+                }
+            },
+            TxType::Unstake => {
+                // Validate unstaking
+                let staker_hash = derive_address_from_pk(&tx.inputs[0].pub_key);
+                let current_height = self.blocks.len() as u64;
+                
+                let pos_state = match &mut self.pos_state {
+                    Some(state) => state,
+                    None => {
+                        info!("PoS state not initialized");
+                        return false;
+                    }
+                };
+
+                // Request unstake
+                if let Err(e) = pos_state.request_unstake(&staker_hash, total_in, current_height) {
+                    info!("Unstaking request failed: {}", e);
+                    return false;
+                }
+
+                // Process any mature withdrawals
+                let processed_withdrawals = pos_state.process_withdrawals(current_height);
+                
+                // Create UTXOs for processed withdrawals
+                for (address, amount) in processed_withdrawals {
+                    let new_utxo = UTXO {
+                        amount,
+                        owner_hash: address.clone(),
+                    };
+                    let new_id = format!("unstake-{}-{}", current_height, address.len());
+                    self.utxos.insert(new_id, new_utxo);
+                }
+            }
         }
 
         true
@@ -244,14 +323,23 @@ impl Blockchain {
             .unwrap()
             .as_secs();
 
-        // Get stakers for proposer selection
+        // Initialize VRF if needed
+        if pos_state.vrf.is_none() {
+            if let Err(e) = pos_state.initialize_vrf() {
+                info!("Failed to initialize VRF: {}", e);
+                return None;
+            }
+        }
+
+        // Get stakers and VRF for proposer selection
         let stakers: Vec<&Staker> = pos_state.stakers.values().collect();
+        let vrf = pos_state.vrf.as_mut()?;
         
         // Use VRF to select proposer
         let proposer = crate::blockchain::consensus::vrf::select_proposer(
             &stakers,
             &prev_hash,
-            &mut pos_state.vrf
+            vrf
         )?;
 
         // For MVP, we're not implementing actual transaction selection
