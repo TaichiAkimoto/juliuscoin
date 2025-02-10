@@ -39,7 +39,7 @@ pub struct SignedMessage {
     pub signature: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Debug)]
 struct Peer {
     address: PQAddress,
     socket_addr: SocketAddr,
@@ -309,17 +309,33 @@ impl P2PNetwork {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                let peers_lock = peers.lock().await;
-                
-                for peer in peers_lock.values() {
-                    let last_seen = *peer.last_seen.lock().await;
-                    if last_seen.elapsed() > HEARTBEAT_INTERVAL * 2 {
-                        warn!("Peer {} hasn't responded to heartbeat", peer.socket_addr);
-                        continue;
+                let mut timed_out_peers = vec![];
+                {
+                    let peers_lock = peers.lock().await;
+                    for (peer_key, peer) in peers_lock.iter() {
+                        let last_seen = *peer.last_seen.lock().await;
+                        if last_seen.elapsed() > HEARTBEAT_INTERVAL * 2 {
+                            warn!("Peer {} hasn't responded to heartbeat", peer.socket_addr);
+                            timed_out_peers.push((peer_key.clone(), peer.socket_addr));
+                        } else {
+                            if let Err(e) = Self::send_signed_static(peer, &Message::Heartbeat, &keypair).await {
+                                warn!("Failed to send heartbeat to peer {}: {}", peer.socket_addr, e);
+                            }
+                        }
                     }
-                    
-                    if let Err(e) = Self::send_signed_static(peer, &Message::Heartbeat, &keypair).await {
-                        warn!("Failed to send heartbeat to peer {}: {}", peer.socket_addr, e);
+                }
+                // Attempt reconnection for timed-out peers
+                for (peer_key, addr) in timed_out_peers {
+                    info!("Attempting to reconnect to peer {}", addr);
+                    match Self::connect_to_peer_static(addr, peers.clone(), &keypair).await {
+                        Ok(_) => {
+                            info!("Successfully reconnected to peer {}", addr);
+                        },
+                        Err(e) => {
+                            warn!("Reconnection failed for {}: {}. Evicting peer.", addr, e);
+                            let mut peers_lock = peers.lock().await;
+                            peers_lock.remove(&peer_key);
+                        }
                     }
                 }
             }

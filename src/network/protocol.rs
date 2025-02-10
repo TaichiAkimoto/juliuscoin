@@ -327,20 +327,33 @@ impl P2PNetwork {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
-                let mut peers = peers.lock().await;
-                
-                // Remove disconnected peers
-                peers.retain(|_, peer| {
-                    let last_seen = peer.last_seen.try_lock()
-                        .map(|guard| *guard)
-                        .unwrap_or_else(|_| Instant::now());
-                    Instant::now().duration_since(last_seen).as_secs() < HEARTBEAT_INTERVAL * 2
-                });
-
-                // Send heartbeat to remaining peers
-                for peer in peers.values() {
-                    if let Err(e) = network.send_heartbeat(peer).await {
-                        error!("Failed to send heartbeat to {}: {}", peer.socket_addr, e);
+                let mut timed_out_peers = vec![];
+                {
+                    let peers_lock = peers.lock().await;
+                    for (peer_key, peer) in peers_lock.iter() {
+                        let last_seen = *peer.last_seen.lock().await;
+                        if last_seen.elapsed() > Duration::from_secs(HEARTBEAT_INTERVAL * 2) {
+                            warn!("Peer {} hasn't responded to heartbeat", peer.socket_addr);
+                            timed_out_peers.push((peer_key.clone(), peer.socket_addr));
+                        } else {
+                            if let Err(e) = network.send_heartbeat(peer).await {
+                                warn!("Failed to send heartbeat to peer {}: {}", peer.socket_addr, e);
+                            }
+                        }
+                    }
+                }
+                // Attempt reconnection for timed out peers
+                for (peer_key, addr) in timed_out_peers {
+                    info!("Attempting to reconnect to peer {}", addr);
+                    match network.connect_to_peer(addr).await {
+                        Ok(_) => {
+                            info!("Successfully reconnected to peer {}", addr);
+                        },
+                        Err(e) => {
+                            warn!("Reconnection failed for {}: {}. Evicting peer.", addr, e);
+                            let mut peers_lock = peers.lock().await;
+                            peers_lock.remove(&peer_key);
+                        }
                     }
                 }
             }
