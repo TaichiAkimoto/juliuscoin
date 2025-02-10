@@ -45,6 +45,19 @@ pub struct DilithiumKeypair {
     pub secret: SecretKey,
 }
 
+impl Clone for DilithiumKeypair {
+    fn clone(&self) -> Self {
+        // Create new keypair by cloning the bytes
+        let pk_bytes = self.public.as_bytes();
+        let sk_bytes = self.secret.as_bytes();
+        
+        Self {
+            public: PublicKey::from_bytes(pk_bytes).unwrap(),
+            secret: SecretKey::from_bytes(sk_bytes).unwrap(),
+        }
+    }
+}
+
 pub fn generate_dilithium_keypair() -> DilithiumKeypair {
     let (pk, sk) = keypair();
     DilithiumKeypair {

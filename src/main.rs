@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Initialize components
     let mut chain = Blockchain::new();
     let _wallet = Wallet::new();
-    let _network = P2PNetwork::new();
+    let _network = P2PNetwork::new(8333); // Using standard Bitcoin port as default
     let mut governance = Governance::new(1000, 1000); // Minimum stake and voting period
     let mut pos_state = PoSState::new().expect("Failed to initialize PoS state");
     let mempool: Vec<Transaction> = Vec::new();
@@ -62,10 +62,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Consensus step
-        if let Some(block) = chain.propose_block(&mut pos_state) {
-            if chain.add_block(block) {
-                info!("New block added to chain");
-            }
+        if let Some(block) = chain.propose_block() {
+            let block_hash = chain.hash_block(&block);
+            info!("New block proposed with hash: {}", hex::encode(&block_hash));
         }
     }
 }

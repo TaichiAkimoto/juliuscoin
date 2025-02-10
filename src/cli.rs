@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use crate::governance::{Governance, JIPType, JIPStatus, VoteType};
 use crate::cryptography::crypto::PQAddress;
+use crate::cryptography::wallet::{Wallet, Mnemonic, WalletError, EntropySize};
 use log::info;
 
 #[derive(Parser)]
@@ -12,6 +13,61 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Create a new wallet
+    WalletCreate {
+        /// Generate with mnemonic phrase
+        #[arg(long)]
+        mnemonic: bool,
+
+        /// Use 12 words instead of 24 (only with --mnemonic)
+        #[arg(long)]
+        short_words: bool,
+
+        /// Password to encrypt the wallet
+        #[arg(short, long)]
+        password: Option<String>,
+
+        /// Optional BIP39 passphrase for additional security
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+
+    /// Recover a wallet from mnemonic phrase
+    WalletRecover {
+        /// The mnemonic phrase
+        #[arg(long)]
+        mnemonic: String,
+
+        /// Password to encrypt the wallet
+        #[arg(short, long)]
+        password: Option<String>,
+
+        /// Optional BIP39 passphrase for additional security
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+
+    /// Show wallet information
+    WalletInfo,
+
+    /// Backup wallet to a file
+    WalletBackup {
+        /// Path to save the backup
+        #[arg(short, long)]
+        path: String,
+    },
+
+    /// Restore wallet from a backup file
+    WalletRestore {
+        /// Path to the backup file
+        #[arg(short, long)]
+        path: String,
+
+        /// Password to encrypt the restored wallet
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+
     /// JIPの提案
     Propose {
         /// 提案のタイトル
@@ -25,6 +81,14 @@ pub enum Commands {
         /// 提案の説明
         #[arg(short, long)]
         description: String,
+
+        /// 資金調達要求額 (オプション)
+        #[arg(short, long)]
+        funding: Option<u64>,
+
+        /// 提案デポジット額
+        #[arg(short, long)]
+        deposit: u64,
     },
 
     /// JIPへの投票
@@ -72,7 +136,99 @@ impl CliHandler {
         let cli = Cli::parse_from(args);
 
         match cli.command {
-            Commands::Propose { title, jip_type, description } => {
+            Commands::WalletCreate { mnemonic: use_mnemonic, short_words, password, passphrase } => {
+                if use_mnemonic {
+                    let mnemonic = if short_words {
+                        Mnemonic::generate_with_size(EntropySize::Bits128)
+                    } else {
+                        Mnemonic::generate_with_size(EntropySize::Bits256)
+                    };
+
+                    info!("Generated mnemonic phrase: {}", mnemonic.as_str());
+                    info!("Word count: {}", mnemonic.word_count());
+                    info!("IMPORTANT: Please write down your mnemonic phrase and store it securely!");
+                    info!("You will need it to recover your wallet if you lose access.");
+
+                    let mut mnemonic = mnemonic;
+                    if let Some(pass) = passphrase {
+                        mnemonic.set_passphrase(&pass);
+                        info!("BIP39 passphrase set successfully");
+                    }
+                    
+                    let wallet = Wallet::from_mnemonic(&mnemonic)?;
+                    if let Some(pass) = password {
+                        wallet.save_encrypted(&pass)?;
+                        info!("Wallet encrypted and saved successfully");
+                    } else {
+                        wallet.save()?;
+                        info!("Wallet saved successfully");
+                    }
+                } else {
+                    let wallet = Wallet::new()?;
+                    if let Some(pass) = password {
+                        wallet.save_encrypted(&pass)?;
+                        info!("Wallet encrypted and saved successfully");
+                    } else {
+                        wallet.save()?;
+                        info!("Wallet saved successfully");
+                    }
+                }
+                Ok(())
+            }
+
+            Commands::WalletRecover { mnemonic: phrase, password, passphrase } => {
+                let mut mnemonic = Mnemonic::from_phrase(&phrase)
+                    .map_err(|e| format!("Invalid mnemonic phrase: {}", e))?;
+
+                if let Some(pass) = passphrase {
+                    mnemonic.set_passphrase(&pass);
+                    info!("BIP39 passphrase set successfully");
+                }
+                
+                let wallet = Wallet::from_mnemonic(&mnemonic)?;
+                if let Some(pass) = password {
+                    wallet.save_encrypted(&pass)?;
+                    info!("Wallet recovered and saved with encryption");
+                } else {
+                    wallet.save()?;
+                    info!("Wallet recovered and saved");
+                }
+                Ok(())
+            }
+
+            Commands::WalletInfo => {
+                let wallet = Wallet::load("wallet.dat")
+                    .map_err(|e| format!("Failed to load wallet: {}", e))?;
+                info!("Wallet Address: {}", hex::encode(&wallet.address_hash));
+                if let Some(mnemonic) = wallet.get_mnemonic() {
+                    info!("Has mnemonic backup: Yes ({} words)", mnemonic.split_whitespace().count());
+                } else {
+                    info!("Has mnemonic backup: No");
+                }
+                Ok(())
+            }
+
+            Commands::WalletBackup { path } => {
+                let wallet = Wallet::load("wallet.dat")
+                    .map_err(|e| format!("Failed to load wallet: {}", e))?;
+                wallet.backup(&path)?;
+                info!("Wallet backed up successfully to: {}", path);
+                Ok(())
+            }
+
+            Commands::WalletRestore { path, password } => {
+                let wallet = Wallet::restore_from_backup(&path)?;
+                if let Some(pass) = password {
+                    wallet.save_encrypted(&pass)?;
+                    info!("Wallet restored and saved with encryption");
+                } else {
+                    wallet.save()?;
+                    info!("Wallet restored and saved");
+                }
+                Ok(())
+            }
+
+            Commands::Propose { title, jip_type, description, funding, deposit } => {
                 let jip_type = match jip_type.to_lowercase().as_str() {
                     "core" => JIPType::Core,
                     "network" => JIPType::Network,
@@ -88,6 +244,8 @@ impl CliHandler {
                     description,
                     1000000, // TODO: Get actual stake amount
                     self.current_block,
+                    funding,
+                    deposit,
                 ) {
                     Ok(jip_id) => {
                         info!("JIP proposed successfully with ID: {}", jip_id);
