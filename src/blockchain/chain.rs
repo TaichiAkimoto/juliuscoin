@@ -77,6 +77,12 @@ pub struct Transaction {
     pub outputs: Vec<TxOutput>,
     /// Minimum lock period for staking (in blocks), only used for Stake transactions
     pub lock_period: Option<u64>,
+    /// Gas limit set by the transaction sender
+    pub gas_limit: u64,
+    /// Gas price the sender is willing to pay above base fee
+    pub max_priority_fee: u64,
+    /// Actual gas used by the transaction
+    pub gas_used: u64,
 }
 
 /// Represents a block in the blockchain.
@@ -100,6 +106,12 @@ pub struct Block {
     pub block_signature: Vec<u8>,
     /// VRF proof for proposer selection
     pub vrf_proof: Vec<u8>,
+    /// Base fee per gas unit (EIP-1559 style)
+    pub base_fee: u64,
+    /// Target gas usage per block
+    pub gas_target: u64,
+    /// Actual gas used in this block
+    pub gas_used: u64,
 }
 
 // Helper struct for fork detection
@@ -295,12 +307,104 @@ impl Blockchain {
             proposer_address: vec![],
             block_signature: vec![],
             vrf_proof: Vec::new(),
+            base_fee: 21000, // Initial base fee (similar to Ethereum)
+            gas_target: 15_000_000, // Target gas per block (similar to Ethereum)
+            gas_used: 0,
         };
         Self {
             blocks: vec![genesis_block],
             utxos: std::collections::HashMap::new(),
             pos_handle: PosStateHandle::new().ok(),
         }
+    }
+
+    /// Calculate the priority fee portion of a transaction
+    fn calculate_priority_fee(&self, tx: &Transaction, block: &Block) -> u64 {
+        let base_fee_portion = block.base_fee * tx.gas_used;
+        let total_fee = tx.inputs.iter()
+            .map(|inp| self.utxos.get(&inp.utxo_id).map(|u| u.amount).unwrap_or(0))
+            .sum::<u64>()
+            .saturating_sub(tx.outputs.iter().map(|o| o.amount).sum::<u64>());
+        
+        total_fee.saturating_sub(base_fee_portion)
+    }
+
+    /// Estimate gas cost for a transaction
+    fn estimate_transaction_gas(&self, tx: &Transaction) -> u64 {
+        let mut gas = match tx.tx_type {
+            TxType::Regular => 21000, // Base cost for regular transactions
+            TxType::Stake => 40000,   // Higher cost for staking operations
+            TxType::Unstake => 40000, // Higher cost for unstaking
+            TxType::BlockReward => 0, // No gas cost for block rewards
+        };
+
+        // Add cost for inputs
+        gas += tx.inputs.len() as u64 * 16000; // Cost per input
+
+        // Add cost for outputs
+        gas += tx.outputs.len() as u64 * 8000; // Cost per output
+
+        // Add cost for data
+        let tx_data_size = bincode::serialize(tx).unwrap().len() as u64;
+        gas += tx_data_size * 16; // 16 gas per byte of transaction data
+
+        gas
+    }
+
+    /// Process a block with the PoS state
+    fn process_block_with_pos(&mut self, block: Block) -> Result<(), BlockValidationError> {
+        let pos_handle = match &mut self.pos_handle {
+            Some(handle) => handle,
+            None => return Err(BlockValidationError::InvalidProposer("PoS state not initialized".to_string())),
+        };
+
+        // Calculate and set the base fee for this block
+        let base_fee = {
+            let prev_block = self.blocks.last().unwrap();
+            self.calculate_next_base_fee(prev_block)
+        };
+
+        let mut block = block;
+        block.base_fee = base_fee;
+        block.gas_target = self.blocks.last().unwrap().gas_target; // Maintain the same target
+        
+        // Calculate gas usage for all transactions
+        let mut total_gas_used = 0;
+        
+        // First pass: estimate gas and validate limits
+        for tx in &mut block.transactions {
+            // Use the improved gas estimation
+            tx.gas_used = self.estimate_transaction_gas(tx);
+            
+            if tx.gas_used > tx.gas_limit {
+                return Err(BlockValidationError::InvalidTransaction(
+                    "Transaction exceeds gas limit".to_string()
+                ));
+            }
+            
+            total_gas_used += tx.gas_used;
+        }
+        
+        // Set actual gas used in block
+        block.gas_used = total_gas_used;
+        
+        // Second pass: validate priority fees
+        for tx in &block.transactions {
+            let priority_fee = self.calculate_priority_fee(tx, &block);
+            if priority_fee < tx.max_priority_fee {
+                return Err(BlockValidationError::InvalidTransaction(
+                    "Insufficient priority fee".to_string()
+                ));
+            }
+        }
+        
+        // Handle fees
+        self.handle_block_fees(&block)?;
+
+        // Add the block to the chain
+        self.blocks.push(block);
+        
+        Ok(())
     }
 
     /// Computes the block reward for a given block height
@@ -654,6 +758,19 @@ impl Blockchain {
 
         // Calculate fee
         let fee = total_in - total_out;
+        
+        // Validate gas and fee
+        if tx.gas_used > tx.gas_limit {
+            return Ok((0, false));
+        }
+
+        // Ensure fee covers base fee plus priority fee
+        let last_block = self.blocks.last().unwrap();
+        let min_required_fee = last_block.base_fee * tx.gas_used;
+        if fee < min_required_fee {
+            return Ok((0, false));
+        }
+
         Ok((fee, true))
     }
 
@@ -688,71 +805,79 @@ impl Blockchain {
         }
     }
 
-    /// Adds a new block to the chain after validation
-    pub fn add_block(&mut self, block: Block, governance: &mut Governance) -> Result<(), BlockValidationError> {
-        // First validate the block without modifying state
-        let validation = self.validate_block(&block);
-        validation.validation?;
-
-        // Clone block for modification
-        let mut block_to_add = block.clone();
-
-        // Apply all regular transactions first
-        for tx in &block.transactions {
-            if !self.apply_transaction(tx) {
-                return Err(BlockValidationError::InvalidTransaction(
-                    "Failed to apply transaction".to_string()
-                ));
-            }
-        }
-
-        // Calculate treasury fee
-        let treasury_fee = (validation.total_fees * governance.get_treasury_fee_rate()) / 10000;
-        let proposer_fee = validation.total_fees - treasury_fee;
-
-        // Add block reward transaction with fees (minus treasury portion)
-        let block_reward = self.compute_block_reward(block.index) + proposer_fee;
-        if block_reward > 0 {
-            let reward_tx = Transaction {
-                tx_type: TxType::BlockReward,
-                inputs: vec![],
-                outputs: vec![TxOutput {
-                    amount: block_reward,
-                    recipient_hash: block.proposer_address.clone(),
-                }],
-                lock_period: None,
+    /// Calculate and apply fees for a block
+    fn handle_block_fees(&mut self, block: &Block) -> Result<(), BlockValidationError> {
+        let (total_fees, burned_fees) = self.calculate_tx_fees(block);
+        let proposer_reward = total_fees.saturating_sub(burned_fees);
+        
+        // Create burn UTXO (effectively removing coins from circulation)
+        if burned_fees > 0 {
+            let burn_utxo = UTXO {
+                amount: burned_fees,
+                owner_hash: vec![0; 32], // Burn address (all zeros)
             };
-
-            if !self.apply_transaction(&reward_tx) {
-                return Err(BlockValidationError::InvalidReward(
-                    "Failed to apply block reward transaction".to_string()
-                ));
-            }
-
-            block_to_add.transactions.push(reward_tx);
-            info!("Added block reward of {} coins to proposer", block_reward as f64 / 1_000_000_000.0);
+            let burn_utxo_id = format!("burn-{}-{}", block.index, burned_fees);
+            self.utxos.insert(burn_utxo_id, burn_utxo);
         }
-
-        // Add treasury fee
-        if treasury_fee > 0 {
-            governance.collect_treasury_fees(treasury_fee);
-            info!("Added {} coins to governance treasury", treasury_fee as f64 / 1_000_000_000.0);
+        
+        // Add remaining fees to proposer reward
+        if proposer_reward > 0 {
+            let reward_utxo = UTXO {
+                amount: proposer_reward,
+                owner_hash: block.proposer_address.clone(),
+            };
+            let reward_utxo_id = format!("fee-reward-{}-{}", block.index, proposer_reward);
+            self.utxos.insert(reward_utxo_id, reward_utxo);
         }
-
-        // Update PoS state if needed
-        if let Some(pos_handle) = &mut self.pos_handle {
-            Self::update_pos_state(
-                pos_handle,
-                block.index,
-                &block.proposer_address,
-                &validation.block_hash,
-                validation.checkpoint_needed,
-            );
-        }
-
-        // Finally add the block
-        self.blocks.push(block_to_add);
+        
         Ok(())
+    }
+
+    /// Calculate the base fee for the next block based on current block's gas usage
+    fn calculate_next_base_fee(&self, current_block: &Block) -> u64 {
+        const BASE_FEE_MAX_CHANGE_DENOMINATOR: u64 = 8; // Maximum 12.5% change per block
+        
+        if current_block.gas_used == current_block.gas_target {
+            return current_block.base_fee;
+        }
+        
+        let gas_used_delta = if current_block.gas_used > current_block.gas_target {
+            current_block.gas_used - current_block.gas_target
+        } else {
+            current_block.gas_target - current_block.gas_used
+        };
+        
+        let base_fee_per_gas_delta = std::cmp::max(
+            1,
+            current_block.base_fee * gas_used_delta / current_block.gas_target / BASE_FEE_MAX_CHANGE_DENOMINATOR
+        );
+        
+        if current_block.gas_used > current_block.gas_target {
+            current_block.base_fee + base_fee_per_gas_delta
+        } else {
+            current_block.base_fee.saturating_sub(base_fee_per_gas_delta)
+        }
+    }
+
+    /// Calculate transaction fees for a block
+    fn calculate_tx_fees(&self, block: &Block) -> (u64, u64) {
+        let mut total_fees = 0;
+        let mut burned_fees = 0;
+        
+        for tx in &block.transactions {
+            let in_sum = tx.inputs.iter().map(|inp| {
+                self.utxos.get(&inp.utxo_id).map(|u| u.amount).unwrap_or(0)
+            }).sum::<u64>();
+            let out_sum = tx.outputs.iter().map(|o| o.amount).sum::<u64>();
+            let tx_fee = in_sum.saturating_sub(out_sum);
+            
+            // Base fee is burned, remainder goes to proposer
+            let burn_amount = std::cmp::min(tx_fee, block.base_fee * tx.gas_used);
+            burned_fees += burn_amount;
+            total_fees += tx_fee;
+        }
+        
+        (total_fees, burned_fees)
     }
 
     /// Computes the hash of a block
@@ -808,6 +933,9 @@ impl Blockchain {
             proposer_address: proposer.address_hash.clone(),
             block_signature: Vec::new(),
             vrf_proof,
+            base_fee: 0,
+            gas_target: 0,
+            gas_used: 0,
         };
 
         // Record proposal
