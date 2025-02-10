@@ -915,6 +915,52 @@ impl Blockchain {
 
         Some(block)
     }
+
+    /// Returns the current height of the blockchain as the number of blocks.
+    pub fn get_height(&self) -> u64 {
+        self.blocks.len() as u64
+    }
+
+    /// Returns a range of blocks from start (inclusive) to end (exclusive).
+    /// Returns an error if the range is invalid.
+    pub fn get_blocks_range(&self, start: u64, end: u64) -> anyhow::Result<Vec<Block>> {
+        if start > end || end > self.blocks.len() as u64 {
+            Err(anyhow::anyhow!("Invalid block range: start={}, end={}, height={}", start, end, self.blocks.len()))
+        } else {
+            Ok(self.blocks[start as usize..end as usize].to_vec())
+        }
+    }
+
+    /// Adds a new block to the blockchain if its index matches the current height.
+    pub fn add_block(&mut self, block: Block) -> anyhow::Result<()> {
+        // 1. Basic validation
+        if block.index != self.get_height() {
+            Err(anyhow::anyhow!("Block index {} does not match chain height {}", block.index, self.get_height()))
+        } else {
+            self.blocks.push(block);
+            Ok(())
+        }
+    }
+
+    /// Add a height() method as required by protocol.rs
+    pub fn height(&self) -> u64 {
+        self.blocks.len() as u64
+    }
+
+    /// Add get_chain_work() method for calculating chain work; here we simply return the number of blocks.
+    pub fn get_chain_work(&self) -> u64 {
+        self.blocks.len() as u64
+    }
+
+    /// Add revert_to_height() method to truncate the chain back to a given height
+    pub fn revert_to_height(&mut self, height: u64) -> anyhow::Result<()> {
+        if height > self.blocks.len() as u64 {
+            Err(anyhow::anyhow!("Cannot revert to height {} because chain height is {}", height, self.blocks.len()))
+        } else {
+            self.blocks.truncate(height as usize);
+            Ok(())
+        }
+    }
 }
 
 pub trait BlockChain {
@@ -1285,14 +1331,13 @@ impl Chain {
         // 5. Update PoS state if needed
         let block_hash = self.calculate_block_hash(&block);
         if let Some(pos_handle) = &mut self.pos_handle {
-            let checkpoint_needed = pos_handle.should_create_checkpoint(block.index);
-            self.update_pos_state(
-                pos_handle,
-                block.index,
-                &block.proposer_address,
-                &block_hash,
-                checkpoint_needed,
-            );
+            // Record the proposal
+            pos_handle.record_proposal(block.index, &block.proposer_address, &block_hash);
+            
+            // Create checkpoint if needed
+            if pos_handle.should_create_checkpoint(block.index) {
+                pos_handle.create_checkpoint(block.index);
+            }
         }
 
         // 6. Add block to chain

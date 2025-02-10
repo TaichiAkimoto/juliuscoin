@@ -15,7 +15,7 @@ use aes_gcm::{
 use rand::Rng;
 use futures::future::join_all;
 
-use crate::blockchain::chain::{Block, Transaction, BlockChain, Chain, BlockValidationError, BlockValidationResult};
+use crate::blockchain::chain::{Block, Transaction, BlockChain, Blockchain, BlockValidationError, BlockValidationResult};
 use crate::cryptography::crypto::{
     PQAddress, derive_address_from_pk,
 };
@@ -63,6 +63,10 @@ struct SyncState {
     fork_points: Vec<(u64, Vec<u8>)>, // (height, hash)
 }
 
+// Add Send + Sync marker traits
+unsafe impl Send for SyncState {}
+unsafe impl Sync for SyncState {}
+
 impl SyncState {
     fn new(current_height: u64) -> Self {
         Self {
@@ -88,11 +92,15 @@ pub struct P2PNetwork {
     port: u16,
     peers: Arc<Mutex<HashMap<Vec<u8>, Arc<Peer>>>>,
     keypair: (Vec<u8>, Vec<u8>), // Kyber (pk, sk)
-    chain: Arc<Mutex<Chain>>,
+    chain: Arc<Mutex<Blockchain>>,
 }
 
+// Add Send + Sync bounds to ensure thread safety
+unsafe impl Send for P2PNetwork {}
+unsafe impl Sync for P2PNetwork {}
+
 impl P2PNetwork {
-    pub fn new(port: u16, chain: Chain) -> Arc<Self> {
+    pub fn new(port: u16, chain: Blockchain) -> Arc<Self> {
         Arc::new(Self {
             port,
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -114,19 +122,26 @@ impl P2PNetwork {
         self.spawn_heartbeat_task();
 
         // Handle incoming connections
-        let network = self.clone();
+        let network = Arc::new(self.clone());
         tokio::spawn(async move {
             while let Some((stream, addr)) = rx.recv().await {
                 let peer_addr = addr.to_string();
-                if let Err(e) = network.handle_peer(stream, addr).await {
-                    error!("Error handling peer {}: {}", peer_addr, e);
-                }
+                let network = network.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = network.handle_peer(stream, addr).await {
+                        error!("Error handling peer {}: {}", peer_addr, e);
+                    }
+                });
             }
         });
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            if self.peers.lock().await.len() >= MAX_PEERS {
+            let peers_len = {
+                let peers_guard = self.peers.lock().await;
+                peers_guard.len()
+            };
+            if peers_len >= MAX_PEERS {
                 warn!("Max peers reached, rejecting connection from {}", addr);
                 continue;
             }
@@ -208,7 +223,7 @@ impl P2PNetwork {
         // Get our current chain height
         let our_height = {
             let chain = self.chain.lock().await;
-            chain.get_height()
+            chain.height()
         };
 
         // Request peer's chain status
@@ -328,33 +343,47 @@ impl P2PNetwork {
             loop {
                 tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
                 let mut timed_out_peers = vec![];
+                
+                // Collect timed out peers
                 {
-                    let peers_lock = peers.lock().await;
-                    for (peer_key, peer) in peers_lock.iter() {
-                        let last_seen = *peer.last_seen.lock().await;
+                    let peers_guard = peers.lock().await;
+                    for (peer_key, peer) in peers_guard.iter() {
+                        let last_seen = {
+                            let last_seen_guard = peer.last_seen.lock().await;
+                            *last_seen_guard
+                        };
                         if last_seen.elapsed() > Duration::from_secs(HEARTBEAT_INTERVAL * 2) {
                             warn!("Peer {} hasn't responded to heartbeat", peer.socket_addr);
                             timed_out_peers.push((peer_key.clone(), peer.socket_addr));
                         } else {
-                            if let Err(e) = network.send_heartbeat(peer).await {
-                                warn!("Failed to send heartbeat to peer {}: {}", peer.socket_addr, e);
-                            }
+                            let network_clone = network.clone();
+                            let peer_clone = peer.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = network_clone.send_heartbeat(&peer_clone).await {
+                                    warn!("Failed to send heartbeat to peer {}: {}", peer_clone.socket_addr, e);
+                                }
+                            });
                         }
                     }
                 }
-                // Attempt reconnection for timed out peers
+
+                // Handle timed out peers
                 for (peer_key, addr) in timed_out_peers {
-                    info!("Attempting to reconnect to peer {}", addr);
-                    match network.connect_to_peer(addr).await {
-                        Ok(_) => {
-                            info!("Successfully reconnected to peer {}", addr);
-                        },
-                        Err(e) => {
-                            warn!("Reconnection failed for {}: {}. Evicting peer.", addr, e);
-                            let mut peers_lock = peers.lock().await;
-                            peers_lock.remove(&peer_key);
+                    let network_clone = network.clone();
+                    let peers_clone = peers.clone();
+                    tokio::spawn(async move {
+                        info!("Attempting to reconnect to peer {}", addr);
+                        match network_clone.connect_to_peer(addr).await {
+                            Ok(_) => {
+                                info!("Successfully reconnected to peer {}", addr);
+                            },
+                            Err(e) => {
+                                warn!("Reconnection failed for {}: {}. Evicting peer.", addr, e);
+                                let mut peers_guard = peers_clone.lock().await;
+                                peers_guard.remove(&peer_key);
+                            }
                         }
-                    }
+                    });
                 }
             }
         });
@@ -403,7 +432,7 @@ impl P2PNetwork {
                 
                 // Update sync state if we're syncing
                 let chain = network.chain.lock().await;
-                let current_height = chain.get_height();
+                let current_height = chain.height();
                 drop(chain);
                 
                 let peer_status = peer.status.lock().await;
@@ -418,7 +447,7 @@ impl P2PNetwork {
             Message::GetBlocksAfter(height) => {
                 // Send blocks after specified height
                 let chain = network.chain.lock().await;
-                let current_height = chain.get_height();
+                let current_height = chain.height();
                 let mut blocks = Vec::new();
 
                 if let Ok(block_range) = chain.get_blocks_range(height + 1, current_height) {
@@ -434,7 +463,7 @@ impl P2PNetwork {
                 // Check if we need to sync
                 let our_height = {
                     let chain = network.chain.lock().await;
-                    chain.get_height()
+                    chain.height()
                 };
 
                 if height > our_height {
@@ -495,102 +524,199 @@ impl P2PNetwork {
 
     /// Spawn message handler task for peer
     async fn spawn_message_handler(&self, peer: Arc<Peer>) {
-        let peers = self.peers.clone();
+        let peers = Arc::clone(&self.peers);
+        let chain = Arc::clone(&self.chain);
+        let peer_clone = Arc::clone(&peer);
         let network = Arc::new(self.clone());
         
         tokio::spawn(async move {
+            let mut buf = Vec::new();
+            
             loop {
-                let mut stream = peer.stream.lock().await;
-                
-                // Read message length
-                let len = match stream.read_u32_le().await {
-                    Ok(len) => len as usize,
-                    Err(e) => {
-                        error!("Failed to read message length from peer: {}", e);
-                        break;
+                // Read message length in its own block to drop the lock before awaiting further.
+                let len: usize = {
+                    let mut stream_guard = peer_clone.stream.lock().await;
+                    match stream_guard.read_u32_le().await {
+                        Ok(l) => l as usize,
+                        Err(e) => {
+                            error!("Failed to read message length from peer: {}", e);
+                            break;
+                        }
                     }
                 };
 
                 if len > MAX_MESSAGE_SIZE {
                     error!("Message too large from peer");
-                    peer.update_score(PeerScoreCategory::InvalidMessage).await;
+                    peer_clone.update_score(PeerScoreCategory::InvalidMessage).await;
                     break;
                 }
 
                 // Read encrypted message
-                let mut message_bytes = vec![0u8; len];
-                if let Err(e) = stream.read_exact(&mut message_bytes).await {
-                    error!("Failed to read message from peer: {}", e);
-                    break;
+                buf.resize(len, 0);
+                {
+                    let mut stream_guard = peer_clone.stream.lock().await;
+                    if let Err(e) = stream_guard.read_exact(&mut buf).await {
+                        error!("Failed to read message from peer: {}", e);
+                        break;
+                    }
                 }
-                drop(stream);
 
-                // Decrypt and handle message
-                let encrypted_message: EncryptedMessage = match bincode::deserialize(&message_bytes) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!("Failed to deserialize message: {}", e);
-                        peer.update_score(PeerScoreCategory::InvalidMessage).await;
-                        continue;
-                    }
-                };
-
-                // Decrypt with AES-GCM
-                let cipher = match Aes256Gcm::new_from_slice(&peer.shared_secret) {
-                    Ok(cipher) => cipher,
-                    Err(e) => {
-                        error!("Failed to create cipher: {}", e);
-                        continue;
-                    }
-                };
-
-                let nonce_bytes = Self::generate_nonce();
-                let nonce = Nonce::from_slice(&nonce_bytes);
+                // Process message in a separate task to avoid holding locks
+                let network = network.clone();
+                let peer = peer_clone.clone();
+                let chain = chain.clone();
+                let peers = peers.clone();
+                let message_buf = buf.clone(); // Clone the buffer for the new task
                 
-                let decrypted_data = match cipher.decrypt(nonce, encrypted_message.encrypted_data.as_ref()) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        error!("Failed to decrypt message: {}", e);
-                        peer.update_score(PeerScoreCategory::InvalidMessage).await;
-                        continue;
+                tokio::spawn(async move {
+                    // Decrypt and handle message
+                    let encrypted_message: EncryptedMessage = match bincode::deserialize(&message_buf) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            error!("Failed to deserialize message: {}", e);
+                            peer.update_score(PeerScoreCategory::InvalidMessage).await;
+                            return;
+                        }
+                    };
+
+                    let cipher = match Aes256Gcm::new_from_slice(&peer.shared_secret) {
+                        Ok(cipher) => cipher,
+                        Err(e) => {
+                            error!("Failed to create cipher: {}", e);
+                            return;
+                        }
+                    };
+
+                    let nonce_bytes = P2PNetwork::generate_nonce();
+                    let nonce = Nonce::from_slice(&nonce_bytes);
+
+                    let decrypted_data = match cipher.decrypt(nonce, encrypted_message.encrypted_data.as_ref()) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("Failed to decrypt message: {}", e);
+                            peer.update_score(PeerScoreCategory::InvalidMessage).await;
+                            return;
+                        }
+                    };
+
+                    let message: Message = match bincode::deserialize(&decrypted_data) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            error!("Failed to deserialize decrypted message: {}", e);
+                            peer.update_score(PeerScoreCategory::InvalidMessage).await;
+                            return;
+                        }
+                    };
+
+                    // Update last seen time
+                    {
+                        let mut last_seen = peer.last_seen.lock().await;
+                        *last_seen = Instant::now();
                     }
-                };
 
-                // Deserialize and handle message
-                let message: Message = match bincode::deserialize(&decrypted_data) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!("Failed to deserialize decrypted message: {}", e);
+                    // Handle message
+                    if let Err(e) = P2PNetwork::handle_message_inner(&chain, &peers, &peer, message).await {
+                        error!("Failed to handle message from peer: {}", e);
                         peer.update_score(PeerScoreCategory::InvalidMessage).await;
-                        continue;
+                    } else {
+                        peer.update_score(PeerScoreCategory::ValidMessage).await;
                     }
-                };
-
-                // Update last seen time
-                *peer.last_seen.lock().await = Instant::now();
-
-                // Handle message
-                if let Err(e) = Self::handle_message(network.clone(), peer.clone(), message).await {
-                    error!("Failed to handle message from peer: {}", e);
-                    peer.update_score(PeerScoreCategory::InvalidMessage).await;
-                } else {
-                    peer.update_score(PeerScoreCategory::ValidMessage).await;
-                }
+                });
 
                 // Check peer score and ban if needed
-                let score = *peer.score.lock().await;
+                let score = {
+                    let score_guard = peer_clone.score.lock().await;
+                    *score_guard
+                };
+                
                 if score < PEER_SCORE_THRESHOLD {
-                    warn!("Banning peer {} due to low score: {}", peer.socket_addr, score);
-                    peer.ban(Duration::from_secs(3600)).await; // 1 hour ban
+                    warn!("Banning peer {} due to low score: {}", peer_clone.socket_addr, score);
+                    peer_clone.ban(Duration::from_secs(3600)).await; // 1 hour ban
                     break;
                 }
             }
 
             // Connection lost or peer banned, remove peer
-            let mut peers = peers.lock().await;
-            peers.remove(&peer.address.hash);
-            info!("Peer disconnected: {}", peer.socket_addr);
+            let mut peers_guard = peers.lock().await;
+            peers_guard.remove(&peer_clone.address.hash);
+            info!("Peer disconnected: {}", peer_clone.socket_addr);
         });
+    }
+
+    /// Inner function to handle messages without requiring the entire network
+    async fn handle_message_inner(
+        chain: &Arc<Mutex<Blockchain>>,
+        peers: &Arc<Mutex<HashMap<Vec<u8>, Arc<Peer>>>>,
+        peer: &Arc<Peer>,
+        message: Message,
+    ) -> Result<()> {
+        match message {
+            Message::Block(block) => {
+                let mut chain_guard = chain.lock().await;
+                if let Err(e) = chain_guard.add_block(block) {
+                    peer.update_score(PeerScoreCategory::InvalidBlock).await;
+                    return Err(anyhow!("Failed to add block: {}", e));
+                }
+            }
+            Message::GetBlocks { start, end } => {
+                let chain_guard = chain.lock().await;
+                if let Ok(blocks) = chain_guard.get_blocks_range(start, end) {
+                    drop(chain_guard); // Drop the lock before sending
+                    let response = Message::Blocks(blocks);
+                    Self::send_message_to_peer(peer, response).await?;
+                }
+            }
+            Message::Status { version, height, total_difficulty } => {
+                peer.update_status(version, height, total_difficulty).await;
+            }
+            Message::GetPeers => {
+                let peers_guard = peers.lock().await;
+                let peer_list: Vec<String> = peers_guard.values()
+                    .map(|p| p.socket_addr.to_string())
+                    .collect();
+                drop(peers_guard); // Drop the lock before sending
+                let response = Message::Peers(peer_list);
+                Self::send_message_to_peer(peer, response).await?;
+            }
+            Message::Ping(timestamp) => {
+                let response = Message::Pong(timestamp);
+                Self::send_message_to_peer(peer, response).await?;
+            }
+            Message::Pong(_) => {
+                // Update last seen is already handled
+            }
+            Message::Transaction(tx) => {
+                // TODO: Validate and process transaction
+                peer.update_score(PeerScoreCategory::SuccessfulTxPropagation).await;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Helper function to send a message to a peer
+    async fn send_message_to_peer(peer: &Arc<Peer>, message: Message) -> Result<()> {
+        let message_bytes = bincode::serialize(&message)?;
+        let cipher = Aes256Gcm::new_from_slice(&peer.shared_secret)
+            .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
+        
+        let nonce_bytes = Self::generate_nonce();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        let encrypted_data = cipher.encrypt(nonce, message_bytes.as_ref())
+            .map_err(|e| anyhow!("Failed to encrypt message: {}", e))?;
+
+        let encrypted_message = EncryptedMessage {
+            sender_address: peer.address.hash.clone(),
+            encrypted_data,
+            kyber_ciphertext: vec![], // Empty since key exchange is done
+        };
+
+        let message_bytes = bincode::serialize(&encrypted_message)?;
+        let mut stream = peer.stream.lock().await;
+        stream.write_all(&message_bytes).await?;
+
+        Ok(())
     }
 
     /// Broadcast block to all peers
@@ -628,7 +754,7 @@ impl P2PNetwork {
     /// Start block synchronization process
     pub async fn start_sync(&self) -> Result<()> {
         let chain = self.chain.lock().await;
-        let current_height = chain.get_height() as u64;
+        let current_height = chain.height();
         drop(chain);
 
         let sync_state = Arc::new(Mutex::new(SyncState::new(current_height)));
@@ -679,15 +805,19 @@ impl P2PNetwork {
         // Send request
         self.send_encrypted(&peer, &Message::GetBlocks { start, end }).await?;
 
-        // Spawn timeout handler
-        let network = Arc::new(self.clone());
-        let sync_state_clone = sync_state.clone();
-        let peer_clone = peer.clone();
+        // Create a oneshot channel for the timeout notification
+        let (tx, rx) = tokio::sync::oneshot::channel();
         
+        // Spawn timeout handler
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(SYNC_REQUEST_TIMEOUT)).await;
-            
-            let mut state = sync_state_clone.lock().await;
+            let _ = tx.send(());  // Ignore send errors as the receiver might be dropped
+        });
+
+        // Wait for either the timeout or block receipt
+        if rx.await.is_ok() {
+            // Timeout occurred
+            let mut state = sync_state.lock().await;
             if !state.pending_requests.is_empty() {
                 state.timeout_count += 1;
                 if state.timeout_count > 3 {
@@ -695,13 +825,11 @@ impl P2PNetwork {
                     state.best_peer = None;
                     state.reset();
                 } else {
-                    // Retry with same peer
+                    // Just reset for next attempt
                     state.reset();
-                    drop(state);
-                    let _ = network.request_blocks(peer_clone, sync_state_clone).await;
                 }
             }
-        });
+        }
 
         Ok(())
     }
@@ -712,7 +840,7 @@ impl P2PNetwork {
         
         for block in blocks {
             // Skip if we already have this block
-            if block.index <= chain.get_height() {
+            if block.index <= chain.height() {
                 continue;
             }
 
@@ -753,12 +881,12 @@ impl P2PNetwork {
     /// Handle chain reorganization
     async fn handle_chain_reorganization(
         &self,
-        chain: &mut Chain,
+        chain: &mut Blockchain,
         fork_point: u64,
         new_block: Block,
     ) -> Result<()> {
         // Get the current chain tip
-        let current_tip = chain.get_height();
+        let current_tip = chain.height();
         
         // Create backup of current chain state
         let backup_blocks = chain.get_blocks_range(fork_point, current_tip)?;
@@ -776,7 +904,7 @@ impl P2PNetwork {
         }
         
         info!("Chain reorganization: fork_point={}, old_tip={}, new_tip={}", 
-            fork_point, current_tip, chain.get_height());
+            fork_point, current_tip, chain.height());
         
         Ok(())
     }

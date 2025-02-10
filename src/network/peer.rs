@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use crate::cryptography::crypto::PQAddress;
+use std::fmt;
 
 /// Peer scoring categories and weights
 const SUCCESSFUL_BLOCK_PROPAGATION: i32 = 1;
@@ -29,7 +30,7 @@ pub struct Peer {
 }
 
 /// Peer status information
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PeerStatus {
     pub version: u32,
     pub height: u64,
@@ -113,4 +114,23 @@ pub enum PeerScoreCategory {
     InvalidTx,
     SlowResponse,
     FailedPing,
-} 
+}
+
+impl fmt::Debug for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Only include fields that are easily printable
+        f.debug_struct("Peer")
+            .field("address", &self.address)
+            .field("socket_addr", &self.socket_addr)
+            .field("shared_secret", &"<hidden>")
+            .field("last_seen", &"<hidden>")
+            .field("score", &"<hidden>")
+            .field("status", &"<hidden>")
+            .field("banned_until", &"<hidden>")
+            .finish()
+    }
+}
+
+// Add Send + Sync marker traits
+unsafe impl Send for Peer {}
+unsafe impl Sync for Peer {} 

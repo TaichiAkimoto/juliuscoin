@@ -9,6 +9,8 @@ use juliuscoin::{
 use log::info;
 use anyhow::Result;
 use std::error::Error;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// メイン関数
 #[tokio::main]
@@ -18,9 +20,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("=== Julius Coin MVPノードを起動します ===");
 
     // Initialize components
-    let mut chain = Blockchain::new();
+    let chain = Arc::new(Mutex::new(Blockchain::new()));
     let _wallet = Wallet::new();
-    let _network = P2PNetwork::new(8333); // Using standard Bitcoin port as default
+    let _network = P2PNetwork::new(8333, chain.clone()); // Using standard Bitcoin port as default
     let mut governance = Governance::new(1000, 1000); // Minimum stake and voting period
     let mut pos_state = PoSState::new().expect("Failed to initialize PoS state");
     let mempool: Vec<Transaction> = Vec::new();
@@ -31,7 +33,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         // Process pending transactions
         if let Some(tx) = mempool.first() {
-            if chain.apply_transaction(tx) {
+            let mut chain_guard = chain.lock().await;
+            if chain_guard.apply_transaction(tx) {
                 info!("Transaction processed successfully");
             }
         }
@@ -62,9 +65,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Consensus step
-        if let Some(block) = chain.propose_block() {
-            let block_hash = chain.hash_block(&block);
+        if let Some(block) = {
+            let mut chain_guard = chain.lock().await;
+            chain_guard.propose_block()
+        } {
+            let chain_guard = chain.lock().await;
+            let block_hash = chain_guard.compute_block_hash(&block);
             info!("New block proposed with hash: {}", hex::encode(&block_hash));
         }
     }
+
+    // unreachable
+    Ok(())
 }
