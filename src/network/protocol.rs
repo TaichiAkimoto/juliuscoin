@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ use aes_gcm::{
 use rand::Rng;
 use futures::future::join_all;
 
-use crate::blockchain::chain::{Block, Transaction, BlockChain, Chain};
+use crate::blockchain::chain::{Block, Transaction, BlockChain, Chain, BlockValidationError, BlockValidationResult};
 use crate::cryptography::crypto::{
     PQAddress, derive_address_from_pk,
 };
@@ -42,6 +42,45 @@ fn generate_kyber_keypair() -> (Vec<u8>, Vec<u8>) {
 fn kyber_encapsulate(pk: &[u8]) -> (Vec<u8>, Vec<u8>) {
     // TODO: Implement proper Kyber encapsulation
     (vec![0u8; 32], vec![0u8; 32])
+}
+
+/// Sync state for tracking block synchronization progress
+#[derive(Debug)]
+struct SyncState {
+    /// Current sync target height
+    target_height: u64,
+    /// Height we're currently syncing from
+    current_height: u64,
+    /// Set of block heights requested but not yet received
+    pending_requests: HashSet<u64>,
+    /// Timestamp of last sync request
+    last_request: Instant,
+    /// Number of consecutive timeouts
+    timeout_count: u32,
+    /// Best peer for syncing (most work)
+    best_peer: Option<Arc<Peer>>,
+    /// Known fork points that need resolution
+    fork_points: Vec<(u64, Vec<u8>)>, // (height, hash)
+}
+
+impl SyncState {
+    fn new(current_height: u64) -> Self {
+        Self {
+            target_height: current_height,
+            current_height,
+            pending_requests: HashSet::new(),
+            last_request: Instant::now(),
+            timeout_count: 0,
+            best_peer: None,
+            fork_points: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pending_requests.clear();
+        self.timeout_count = 0;
+        self.last_request = Instant::now();
+    }
 }
 
 #[derive(Clone)]
@@ -169,7 +208,7 @@ impl P2PNetwork {
         // Get our current chain height
         let our_height = {
             let chain = self.chain.lock().await;
-            chain.height()
+            chain.get_height()
         };
 
         // Request peer's chain status
@@ -323,17 +362,8 @@ impl P2PNetwork {
     async fn handle_message(network: Arc<Self>, peer: Arc<Peer>, message: Message) -> Result<()> {
         match message {
             Message::Block(block) => {
-                // Validate and process received block
-                let mut chain = network.chain.lock().await;
-                if chain.validate_block(&block).is_ok() {
-                    if chain.add_block(block).is_ok() {
-                        peer.update_score(PeerScoreCategory::SuccessfulBlockPropagation).await;
-                    } else {
-                        peer.update_score(PeerScoreCategory::InvalidBlock).await;
-                    }
-                } else {
-                    peer.update_score(PeerScoreCategory::InvalidBlock).await;
-                }
+                // Process single block
+                network.process_received_blocks(vec![block], peer).await?;
             }
             Message::GetBlocks { start, end } => {
                 // Send requested blocks
@@ -341,47 +371,47 @@ impl P2PNetwork {
                 let mut blocks = Vec::new();
                 
                 for height in start..=end {
-                    if let Some(block) = chain.get_block_by_height(height) {
-                        blocks.push(block);
-                        if blocks.len() >= MAX_BLOCKS_PER_REQUEST {
+                    if let Ok(block_range) = chain.get_blocks_range(height, height) {
+                        blocks.extend(block_range);
+                        if blocks.len() >= SYNC_BATCH_SIZE {
                             break;
                         }
                     } else {
                         break;
                     }
                 }
+                drop(chain);
 
                 network.send_encrypted(&peer, &Message::Blocks(blocks)).await?;
             }
             Message::Blocks(blocks) => {
                 // Process received blocks
-                let mut chain = network.chain.lock().await;
-                for block in blocks {
-                    if chain.validate_block(&block).is_ok() {
-                        if chain.add_block(block).is_ok() {
-                            peer.update_score(PeerScoreCategory::SuccessfulBlockPropagation).await;
-                        } else {
-                            peer.update_score(PeerScoreCategory::InvalidBlock).await;
-                        }
-                    } else {
-                        peer.update_score(PeerScoreCategory::InvalidBlock).await;
-                    }
+                network.process_received_blocks(blocks, peer.clone()).await?;
+                
+                // Update sync state if we're syncing
+                let chain = network.chain.lock().await;
+                let current_height = chain.get_height();
+                drop(chain);
+                
+                let peer_status = peer.status.lock().await;
+                let target_height = peer_status.height;
+                drop(peer_status);
+                
+                if current_height < target_height {
+                    // Continue syncing
+                    network.request_blocks(peer, Arc::new(Mutex::new(SyncState::new(current_height)))).await?;
                 }
             }
             Message::GetBlocksAfter(height) => {
                 // Send blocks after specified height
                 let chain = network.chain.lock().await;
-                let current_height = chain.height();
+                let current_height = chain.get_height();
                 let mut blocks = Vec::new();
 
-                for h in (height + 1)..=current_height {
-                    if let Some(block) = chain.get_block_by_height(h) {
-                        blocks.push(block);
-                        if blocks.len() >= MAX_BLOCKS_PER_REQUEST {
-                            break;
-                        }
-                    }
+                if let Ok(block_range) = chain.get_blocks_range(height + 1, current_height) {
+                    blocks = block_range;
                 }
+                drop(chain);
 
                 network.send_encrypted(&peer, &Message::Blocks(blocks)).await?;
             }
@@ -391,7 +421,7 @@ impl P2PNetwork {
                 // Check if we need to sync
                 let our_height = {
                     let chain = network.chain.lock().await;
-                    chain.height()
+                    chain.get_height()
                 };
 
                 if height > our_height {
@@ -579,6 +609,162 @@ impl P2PNetwork {
                 peer.update_score(PeerScoreCategory::SuccessfulTxPropagation).await;
             }
         }
+        Ok(())
+    }
+
+    /// Start block synchronization process
+    pub async fn start_sync(&self) -> Result<()> {
+        let chain = self.chain.lock().await;
+        let current_height = chain.get_height() as u64;
+        drop(chain);
+
+        let sync_state = Arc::new(Mutex::new(SyncState::new(current_height)));
+        
+        // Find best peer for syncing
+        let best_peer = self.find_sync_peers().await.into_iter().next();
+        if let Some(peer) = best_peer.clone() {
+            let mut state = sync_state.lock().await;
+            state.best_peer = Some(peer.clone());
+            
+            let peer_status = peer.status.lock().await;
+            state.target_height = peer_status.height;
+            drop(peer_status);
+            
+            // Start sync process
+            self.request_blocks(peer, sync_state.clone()).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Request blocks from peer with timeout and retry logic
+    async fn request_blocks(&self, peer: Arc<Peer>, sync_state: Arc<Mutex<SyncState>>) -> Result<()> {
+        let mut state = sync_state.lock().await;
+        
+        // Check if we need to sync
+        if state.current_height >= state.target_height {
+            return Ok(());
+        }
+
+        // Calculate batch size based on network conditions
+        let batch_size = if state.timeout_count > 0 {
+            SYNC_BATCH_SIZE / (2_u32.pow(state.timeout_count)) as usize
+        } else {
+            SYNC_BATCH_SIZE
+        };
+
+        let start = state.current_height + 1;
+        let end = (start + batch_size as u64 - 1).min(state.target_height);
+
+        // Record pending request
+        for height in start..=end {
+            state.pending_requests.insert(height);
+        }
+        state.last_request = Instant::now();
+        drop(state);
+
+        // Send request
+        self.send_encrypted(&peer, &Message::GetBlocks { start, end }).await?;
+
+        // Spawn timeout handler
+        let network = Arc::new(self.clone());
+        let sync_state_clone = sync_state.clone();
+        let peer_clone = peer.clone();
+        
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(SYNC_REQUEST_TIMEOUT)).await;
+            
+            let mut state = sync_state_clone.lock().await;
+            if !state.pending_requests.is_empty() {
+                state.timeout_count += 1;
+                if state.timeout_count > 3 {
+                    // Try different peer after too many timeouts
+                    state.best_peer = None;
+                    state.reset();
+                } else {
+                    // Retry with same peer
+                    state.reset();
+                    drop(state);
+                    let _ = network.request_blocks(peer_clone, sync_state_clone).await;
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Process received blocks and handle forks
+    async fn process_received_blocks(&self, blocks: Vec<Block>, peer: Arc<Peer>) -> Result<()> {
+        let mut chain = self.chain.lock().await;
+        
+        for block in blocks {
+            // Skip if we already have this block
+            if block.index <= chain.get_height() {
+                continue;
+            }
+
+            // Validate the block
+            match chain.validate_block(&block) {
+                Ok(result) => {
+                    // Check for potential fork
+                    if let Some(fork_point) = result.fork_point {
+                        // Handle fork
+                        if result.total_fees > chain.get_chain_work() {
+                            // Better chain found, reorg
+                            self.handle_chain_reorganization(&mut chain, fork_point, block.clone()).await?;
+                        }
+                    } else {
+                        // Normal block addition
+                        if let Err(e) = chain.add_block(block) {
+                            warn!("Failed to add block: {:?}", e);
+                            peer.update_score(PeerScoreCategory::InvalidBlock).await;
+                            continue;
+                        }
+                    }
+                },
+                Err(BlockValidationError::BelowFinalizedHeight(_)) => {
+                    // Ignore blocks below finalization
+                    continue;
+                },
+                Err(e) => {
+                    warn!("Invalid block from peer: {:?}", e);
+                    peer.update_score(PeerScoreCategory::InvalidBlock).await;
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle chain reorganization
+    async fn handle_chain_reorganization(
+        &self,
+        chain: &mut Chain,
+        fork_point: u64,
+        new_block: Block,
+    ) -> Result<()> {
+        // Get the current chain tip
+        let current_tip = chain.get_height();
+        
+        // Create backup of current chain state
+        let backup_blocks = chain.get_blocks_range(fork_point, current_tip)?;
+        
+        // Revert chain to fork point
+        chain.revert_to_height(fork_point)?;
+        
+        // Try to add new block
+        if let Err(e) = chain.add_block(new_block) {
+            // Restore backup if new chain is invalid
+            for block in backup_blocks {
+                chain.add_block(block)?;
+            }
+            return Err(anyhow!("Failed to add fork block: {:?}", e));
+        }
+        
+        info!("Chain reorganization: fork_point={}, old_tip={}, new_tip={}", 
+            fork_point, current_tip, chain.get_height());
+        
         Ok(())
     }
 } 
