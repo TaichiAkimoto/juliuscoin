@@ -3,8 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 use vrf::openssl::{ECVRF, CipherSuite, Error as VRFError};
 use crate::blockchain::consensus::slashing::{SlashingReason, SlashingRecord};
+use crate::blockchain::consensus::vdf::{VDFProof, SimpleVDF, WesolowskiVDF};
 use log::info;
 use crate::blockchain::consensus::delegation::{DelegationState, StakingPool};
+use anyhow::Result as AnyhowResult;
 
 /// Represents a withdrawal request for unstaking
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -133,6 +135,43 @@ impl PoSState {
             vdf_iterations: 1000,
             delegation: DelegationState::new(10000), // Minimum pool stake of 10000
         })
+    }
+
+    /// Generate a VDF proof for the given input
+    /// 
+    /// # Arguments
+    /// * `input` - The input challenge to the VDF
+    /// 
+    /// # Returns
+    /// * `Result<VDFProof>` - The VDF proof if successful
+    pub fn generate_vdf_proof(&self, input: &[u8]) -> AnyhowResult<VDFProof> {
+        if !self.use_vdf {
+            return Err(anyhow::anyhow!("VDF is not enabled"));
+        }
+
+        // Use the simple VDF implementation for now
+        // In production, you might want to use the Wesolowski VDF
+        let vdf = SimpleVDF::new(self.vdf_iterations);
+        let proof = vdf.generate(input);
+        
+        Ok(proof)
+    }
+
+    /// Verify a VDF proof
+    /// 
+    /// # Arguments
+    /// * `proof` - The VDF proof to verify
+    /// 
+    /// # Returns
+    /// * `bool` - True if the proof is valid
+    pub fn verify_vdf_proof(&self, proof: &VDFProof) -> bool {
+        if !self.use_vdf {
+            return false;
+        }
+
+        // Use the simple VDF implementation for verification
+        let vdf = SimpleVDF::new(self.vdf_iterations);
+        vdf.verify(proof)
     }
 
     pub fn initialize_vrf(&mut self) -> Result<(), VRFError> {
@@ -820,4 +859,4 @@ pub struct StakingInfo {
     pub accumulated_rewards: u64,
     pub last_active_time: u64,
     pub slashing_records: Vec<SlashingRecord>,
-} 
+}

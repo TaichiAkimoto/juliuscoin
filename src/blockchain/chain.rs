@@ -191,16 +191,24 @@ impl PosStateHandle {
         false
     }
 
-    /// Select a proposer using VRF output
+    /// Select a proposer using VRF output and optionally VDF
     pub fn prepare_block_proposal(&mut self, prev_hash: &[u8]) -> Option<(Staker, Vec<u8>)> {
         // Get VRF proof and output
-        let (proof, vrf_output) = self.generate_vrf_proof_and_output(prev_hash)?;
+        let (vrf_proof, vrf_output) = self.generate_vrf_proof_and_output(prev_hash)?;
 
         // Optionally apply VDF if enabled
-        let final_output = if self.inner.use_vdf {
-            apply_vdf(&vrf_output, self.inner.vdf_iterations)
+        let (final_output, final_proof) = if self.inner.use_vdf {
+            // Generate VDF proof using VRF output as input
+            match self.inner.generate_vdf_proof(&vrf_output) {
+                Ok(vdf_proof) => (vdf_proof.output, vrf_proof),
+                Err(_) => {
+                    // Fallback to VRF only if VDF fails
+                    info!("VDF generation failed, falling back to VRF only");
+                    (vrf_output.clone(), vrf_proof)
+                }
+            }
         } else {
-            vrf_output.clone()
+            (vrf_output.clone(), vrf_proof)
         };
 
         // Convert final output to a random value between 0 and 1
@@ -232,7 +240,7 @@ impl PosStateHandle {
             }
         }
 
-        selected.map(|s| (s, proof))
+        selected.map(|s| (s, final_proof))
     }
 
     pub fn initialize_vrf(&mut self) -> Result<(), VRFError> {
@@ -1612,12 +1620,14 @@ impl BlockChain for Chain {
     }
 }
 
+/// Apply VDF to the input using the SimpleVDF implementation
+/// This is a placeholder for the actual VDF implementation in the consensus module
 fn apply_vdf(input: &[u8], iterations: u64) -> Vec<u8> {
-    let mut hash = input.to_vec();
-    for _ in 0..iterations {
-        hash = Sha256::digest(&hash).to_vec();
-    }
-    hash
+    use crate::blockchain::consensus::vdf::SimpleVDF;
+    
+    let vdf = SimpleVDF::new(iterations);
+    let proof = vdf.generate(input);
+    proof.output
 }
 
 impl Chain {
@@ -1804,4 +1814,3 @@ impl BlockChain for Blockchain {
         self.add_block(block)
     }
 }
-
