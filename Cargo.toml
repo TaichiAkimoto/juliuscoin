@@ -12,6 +12,7 @@ ed25519-dalek = "2.0"
 aes-gcm = "0.10.3"
 vrf = "0.2.4"
 sha2 = "0.10.8"
+openssl = "0.10"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

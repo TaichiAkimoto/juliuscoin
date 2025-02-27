@@ -12,6 +12,10 @@
 use serde::{Serialize, Deserialize};
 use crate::cryptography::crypto::{verify_signature, derive_address_from_pk};
 use crate::blockchain::consensus::{PoSState, Staker};
+use crate::blockchain::consensus::staking::finalization::FinalizationProcessor;
+use crate::blockchain::consensus::staking::validator::ValidatorOperations;
+use crate::blockchain::consensus::staking::types::{ValidatorVote, EpochInfo, FinalizationState};
+use crate::blockchain::consensus::staking::withdrawal::WithdrawalProcessor;
 use crate::governance::Governance;
 use log::info;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +29,7 @@ use crate::blockchain::consensus::slashing::SlashingReason;
 use crate::blockchain::utxo::{UTXO, UtxoId};
 use crate::blockchain::script::Script;
 use std::collections::HashMap;
+use openssl::error::ErrorStack;
 
 /// Transaction types supported by the blockchain
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -123,7 +128,7 @@ pub struct PosStateHandle {
 }
 
 impl PosStateHandle {
-    pub fn new() -> Result<Self, VRFError> {
+    pub fn new() -> Result<Self> {
         Ok(Self {
             inner: PoSState::new()?
         })
@@ -289,6 +294,48 @@ impl PosStateHandle {
             }
         }
         false
+    }
+}
+
+impl FinalizationProcessor for PosStateHandle {
+    fn submit_finalization_vote(&mut self, validator_address: &[u8], vote_height: u64, current_height: u64) -> Result<(), String> {
+        self.inner.submit_finalization_vote(validator_address, vote_height, current_height)
+    }
+
+    fn try_justify_and_finalize(&mut self, current_height: u64) {
+        self.inner.try_justify_and_finalize(current_height)
+    }
+
+    fn cleanup_old_votes(&mut self, current_height: u64) {
+        self.inner.cleanup_old_votes(current_height)
+    }
+
+    fn get_voting_status(&self, height: u64) -> (u64, u64) {
+        self.inner.get_voting_status(height)
+    }
+
+    fn is_safe_to_build_on(&self, height: u64, current_height: u64) -> bool {
+        self.inner.is_safe_to_build_on(height, current_height)
+    }
+
+    fn get_finalized_height(&self) -> u64 {
+        self.inner.get_finalized_height()
+    }
+
+    fn is_height_finalized(&self, height: u64) -> bool {
+        self.inner.is_height_finalized(height)
+    }
+
+    fn get_epoch_length(&self) -> u64 {
+        self.inner.get_epoch_length()
+    }
+
+    fn is_epoch_justified(&self, epoch_num: u64) -> bool {
+        self.inner.is_epoch_justified(epoch_num)
+    }
+
+    fn is_epoch_finalized(&self, epoch_num: u64) -> bool {
+        self.inner.is_epoch_finalized(epoch_num)
     }
 }
 
